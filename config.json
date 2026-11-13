@@ -1,0 +1,110 @@
+{
+  "global_settings": {
+    "global_fps": 15,
+    "storage_root": "storage/events",
+    "memory_budget_bytes": 2147483648,
+    "max_inference_threads": 4,
+    "max_writer_threads": 2,
+    "min_free_disk_bytes": 5368709120,
+    "default_encoder": "h264",
+    "platform": "software"
+  },
+  "cameras": [
+    {
+      "camera_id": "CAM_01_BAY_GANTRY",
+      "name": "Tanker Bay 1 (Reliance / HPCL)",
+      "enabled": true,
+      "stream_url": "rtsp://admin:pass@192.168.1.101:554/stream1",
+      "credentials_ref": "vault_bay1_creds",
+      "decode_mode": "software",
+      "stall_timeout_s": 5,
+      "fps": 20,
+      "capture_resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "event_config": {
+        "pre_event_s": 15,
+        "post_event_s": 15,
+        "cooldown_s": 30,
+        "max_clip_s": 120,
+        "output_format": "mp4",
+        "output_fps": 20
+      },
+      "output_video": {
+        "width": 1280,
+        "height": 720,
+        "bitrate_kbps": 900
+      },
+      "assigned_use_cases": [
+        {
+          "use_case_id": "tt_crew_entering_below_tt",
+          "enabled": true,
+          "model_ref": "models/tt_crew_entering_below_tt.onnx",
+          "threshold": 0.45,
+          "priority": 1,
+          "analysis_fps": 20,
+          "model_input_size": 640,
+          "enabled_classes": [
+            "person",
+            "truck"
+          ]
+        },
+        {
+          "use_case_id": "fuel_spillage_detection",
+          "enabled": true,
+          "model_ref": "models/spillage.onnx",
+          "threshold": 0.5,
+          "priority": 2,
+          "analysis_fps": 5,
+          "model_input_size": 320,
+          "enabled_classes": [
+            "spillage"
+          ]
+        }
+      ]
+    },
+    {
+      "camera_id": "CAM_02_ENTRY_GATE",
+      "name": "Entry Gantry & TT Availability",
+      "enabled": true,
+      "stream_url": "rtsp://admin:pass@192.168.1.102:554/stream1",
+      "credentials_ref": "vault_gate_creds",
+      "decode_mode": "software",
+      "stall_timeout_s": 5,
+      "fps": 15,
+      "capture_resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "event_config": {
+        "pre_event_s": 10,
+        "post_event_s": 10,
+        "cooldown_s": 20,
+        "max_clip_s": 90,
+        "output_format": "mp4",
+        "output_fps": 15
+      },
+      "output_video": {
+        "width": 1280,
+        "height": 720,
+        "bitrate_kbps": 800
+      },
+      "assigned_use_cases": [
+        {
+          "use_case_id": "tt_crew_non_availability",
+          "enabled": true,
+          "model_ref": "models/tt_crew_non_availability.onnx",
+          "threshold": 0.4,
+          "priority": 1,
+          "analysis_fps": 10,
+          "model_input_size": 640,
+          "enabled_classes": [
+            "no-TT_Crew_Availability",
+            "tt_crew_available"
+          ]
+        }
+      ]
+    }
+  ]
+}

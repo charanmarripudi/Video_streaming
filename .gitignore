@@ -1,0 +1,21 @@
+# Binaries and build artifacts
+bin/
+*.o
+*.so
+*.dylib
+*.a
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Runtime output clips and snapshots
+storage/events/*.mp4
+storage/events/*.tmp
+storage/events/*.jpg
+storage/events/*.png
+!storage/events/.gitkeep
+
+# Logs and temporary files
+*.log
+*.tmp
