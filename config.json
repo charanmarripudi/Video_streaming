@@ -38,34 +38,15 @@
       },
       "assigned_use_cases": [
         {
-          "use_case_id": "tt_crew_entering_below_tt",
+          "use_case_id": "intrusion",
           "enabled": true,
-          "model_ref": "models/tt_crew_entering_below_tt.onnx",
-          "threshold": 0.45,
+          "model_ref": "models/intrusion.onnx",
+          "threshold": 0.50,
           "priority": 1,
           "analysis_fps": 20,
           "model_input_size": 640,
           "enabled_classes": [
-            "person",
-            "truck"
-          ],
-          "roi_polygon": [
-            [
-              100,
-              150
-            ],
-            [
-              540,
-              150
-            ],
-            [
-              540,
-              420
-            ],
-            [
-              100,
-              420
-            ]
+            "person"
           ],
           "roi_polygon": [
             [100, 150],

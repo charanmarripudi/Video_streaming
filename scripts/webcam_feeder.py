@@ -3,12 +3,17 @@
 Webcam Feeder, Live ONNX Object Detector & ROI Monitor
 Industrial C++ Video Analytics Engine
 
-Upgrades:
-1. PLAIN CAMERA VIEW: Removed green translucent tint completely for clean natural video.
-2. LIVE ONNX DETECTION: Runs YOLOv8n ONNX model in real-time (person, truck, vehicle, etc.).
-3. ROI VIOLATION CHECK: Flags RED bounding box when detected objects enter the ROI zone!
-4. INTERACTIVE ROI: Click to draw ROI points, press 's' to save directly to config.json.
-5. C++ PIPE STREAMING: Feeds frames to C++ engine for pre/post-event recording.
+Key Upgrades:
+1. TARGET MODEL: Uses models/intrusion.onnx exclusively for intrusion monitoring.
+2. ZERO DETECTION FLICKERING / BLINKING: Persistent detection box caching ensures
+   smooth continuous bounding boxes rendered on every frame at full FPS.
+3. STRICT CLASS FILTERING: Only tracks configured classes (e.g., 'person').
+   Furniture, chairs, TVs, and background objects are 100% ignored.
+4. ROI INTRUSION MONITORING: Triggers bright RED alert only when a person enters
+   the user-defined ROI polygon. Emits real-time alert trigger to C++ engine.
+5. NATURAL PLAIN VIDEO: Clean camera video without any green or tinted wash.
+6. PERSISTENT ROI DRAWING: Interactive mouse clicking to draw or refine ROI zone,
+   saved directly to config.json.
 """
 
 import os
@@ -19,19 +24,40 @@ import signal
 import argparse
 import numpy as np
 
-def load_roi_from_config(config_path, camera_id="CAM_01_BAY_GANTRY"):
+def load_camera_use_case_config(config_path, camera_id="CAM_01_BAY_GANTRY"):
+    cfg_data = {
+        "roi_polygon": [],
+        "model_ref": "models/intrusion.onnx",
+        "threshold": 0.50,
+        "enabled_classes": ["person"],
+        "use_case_id": "intrusion",
+        "fps": 20,
+        "width": 640,
+        "height": 480
+    }
     try:
         if os.path.exists(config_path):
             with open(config_path, "r") as f:
                 cfg = json.load(f)
             for cam in cfg.get("cameras", []):
                 if cam.get("camera_id") == camera_id:
+                    cfg_data["fps"] = cam.get("fps", 20)
+                    res = cam.get("capture_resolution", {})
+                    cfg_data["width"] = res.get("width", 640)
+                    cfg_data["height"] = res.get("height", 480)
                     for uc in cam.get("assigned_use_cases", []):
-                        if "roi_polygon" in uc and len(uc["roi_polygon"]) >= 3:
-                            return [tuple(pt) for pt in uc["roi_polygon"]]
+                        if uc.get("enabled", True):
+                            cfg_data["use_case_id"] = uc.get("use_case_id", "intrusion")
+                            cfg_data["model_ref"] = uc.get("model_ref", "models/intrusion.onnx")
+                            cfg_data["threshold"] = float(uc.get("threshold", 0.50))
+                            if "enabled_classes" in uc:
+                                cfg_data["enabled_classes"] = uc["enabled_classes"]
+                            if "roi_polygon" in uc and len(uc["roi_polygon"]) >= 3:
+                                cfg_data["roi_polygon"] = [tuple(pt) for pt in uc["roi_polygon"]]
+                            break
     except Exception as e:
-        print(f"[PREVIEW] Note: Could not load ROI from config: {e}")
-    return []
+        print(f"[PREVIEW] Note: Could not load config: {e}")
+    return cfg_data
 
 def save_roi_to_config(config_path, polygon, camera_id="CAM_01_BAY_GANTRY"):
     try:
@@ -64,7 +90,8 @@ def main():
     parser.add_argument("--fps", type=int, default=20, help="Target FPS (default: 20)")
     parser.add_argument("--pipe", type=str, default="/tmp/video_engine_webcam.pipe", help="FIFO pipe path")
     parser.add_argument("--config", type=str, default="config.json", help="Path to config.json")
-    parser.add_argument("--model", type=str, default="models/yolov8n.onnx", help="Path to ONNX model")
+    parser.add_argument("--model", type=str, default="models/intrusion.onnx", help="Path to ONNX model (default: models/intrusion.onnx)")
+    parser.add_argument("--threshold", type=float, default=None, help="Confidence threshold (e.g. 0.50)")
     parser.add_argument("--preview", action="store_true", default=True, help="Show live OpenCV preview window")
     parser.add_argument("--no-preview", dest="preview", action="store_false", help="Disable live preview window")
     args = parser.parse_args()
@@ -75,20 +102,38 @@ def main():
         print("[ERROR] OpenCV (cv2) is not installed. Please activate hpcl_env.", file=sys.stderr)
         sys.exit(1)
 
-    # 1. Load Live ONNX Object Detection Model
+    # 1. Load Camera & Use-Case Configuration from config.json
+    cfg_data = load_camera_use_case_config(args.config)
+    model_path = args.model if args.model != "models/intrusion.onnx" else cfg_data.get("model_ref", "models/intrusion.onnx")
+    conf_threshold = args.threshold if args.threshold is not None else cfg_data.get("threshold", 0.50)
+    enabled_classes = cfg_data.get("enabled_classes", ["person"])
+    use_case_id = cfg_data.get("use_case_id", "intrusion")
+    camera_id = "CAM_01_BAY_GANTRY"
+
+    print("=======================================================")
+    print("      INDUSTRIAL C++ VIDEO ENGINE - WEBCAM FEEDER      ")
+    print("=======================================================")
+    print(f"  -> Model Path       : {model_path}")
+    print(f"  -> Use Case ID      : {use_case_id}")
+    print(f"  -> Enabled Classes  : {enabled_classes} (All other objects ignored)")
+    print(f"  -> Min Confidence   : {conf_threshold:.2f}")
+    print(f"  -> Resolution       : {args.width}x{args.height} @ {args.fps} FPS")
+    print("=======================================================")
+
+    # 2. Load Live ONNX Object Detection Model (intrusion.onnx)
     detector = None
-    if os.path.exists(args.model):
+    if os.path.exists(model_path):
         try:
             from ultralytics import YOLO
-            print(f"[AI-DETECTOR] Loading ONNX model for live detection: {args.model}...")
-            detector = YOLO(args.model, task="detect")
-            print("[AI-DETECTOR] ONNX Detection Model loaded successfully!")
+            print(f"[AI-DETECTOR] Loading model for intrusion monitoring: {model_path}...")
+            detector = YOLO(model_path, task="detect")
+            print(f"[AI-DETECTOR] ONNX Detection Model loaded successfully!")
         except Exception as e:
             print(f"[WARNING] Could not load Ultralytics ONNX detector: {e}")
     else:
-        print(f"[WARNING] Model file {args.model} not found. Running preview without AI overlay.")
+        print(f"[WARNING] Model file {model_path} not found. Running preview without AI overlay.")
 
-    # 2. Initialize FIFO Pipe
+    # 3. Initialize FIFO Pipe
     if os.path.exists(args.pipe):
         try:
             os.remove(args.pipe)
@@ -102,7 +147,7 @@ def main():
         print(f"[ERROR] Failed to create FIFO pipe {args.pipe}: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # 3. Open Laptop Webcam
+    # 4. Open Laptop Webcam
     cap = cv2.VideoCapture(args.device)
     if not cap.isOpened():
         print(f"[ERROR] Cannot open webcam device {args.device}!", file=sys.stderr)
@@ -120,8 +165,8 @@ def main():
     print(f"[WEBCAM-FEEDER] Frame size: {frame_bytes} bytes (BGR24)")
     print("[WEBCAM-FEEDER] Waiting for C++ Video Engine to connect to pipe...")
 
-    # Load existing ROI from config
-    roi_points = load_roi_from_config(args.config)
+    # Load existing ROI points from config
+    roi_points = cfg_data.get("roi_polygon", [])
     if not roi_points:
         # Default central monitoring zone
         x_pad = int(actual_w * 0.15)
@@ -151,15 +196,16 @@ def main():
         try:
             cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
             cv2.setMouseCallback(window_name, on_mouse)
-            print("[PREVIEW] Interactive Live AI Window Active:")
-            print("  -> Video View  : PLAIN natural video (no green tint)")
-            print("  -> Live AI     : Detecting person, truck, car, etc.")
+            print("\n[PREVIEW] Interactive Live AI Window Active:")
+            print("  -> Video View  : Plain natural video (no tint)")
+            print(f"  -> Model       : {os.path.basename(model_path)}")
+            print(f"  -> Filter      : Only tracking {enabled_classes}")
             print("  -> Left Click  : Add ROI polygon point")
             print("  -> Right Click : Undo last point")
             print("  -> Press 's'   : Save current ROI polygon to config.json")
             print("  -> Press 'r'   : Reset ROI points")
             print("  -> Press 'h'   : Toggle ROI boundary visibility on/off")
-            print("  -> Press 'q'   : Quit")
+            print("  -> Press 'q'   : Quit\n")
         except Exception as e:
             print(f"[PREVIEW] GUI window unavailable: {e}")
             args.preview = False
@@ -167,6 +213,9 @@ def main():
     pipe_fd = None
     running = True
     last_alert_time = 0.0
+
+    # Persistent Detection Cache to ELIMINATE BLINKING / FLICKERING completely
+    cached_detections = []
 
     def sig_handler(sig, frame):
         nonlocal running
@@ -204,76 +253,110 @@ def main():
                 print("[WEBCAM-FEEDER] C++ engine disconnected from pipe. Exiting.")
                 break
 
-            # 2. Render Live Preview Window with AI Detection (PLAIN view, NO green tint)
+            # 2. Render Live Preview Window with Persistent Smooth AI Overlay
             if args.preview:
                 display = frame.copy()
                 roi_poly_np = np.array(drawing_points, np.int32).reshape((-1, 1, 2)) if len(drawing_points) >= 3 else None
 
-                # Live AI Detection using ONNX model
-                alert_in_roi = False
-                detected_count = 0
-
-                if detector is not None and frame_count % 2 == 0: # Run inference every 2 frames for smooth 25+ FPS
+                # Run Inference periodically (every 2 frames) to conserve CPU while updating cache
+                if detector is not None and frame_count % 2 == 0:
                     try:
-                        results = detector(frame, verbose=False, conf=0.35)
+                        results = detector(frame, verbose=False, conf=conf_threshold)
+                        new_detections = []
                         if len(results) > 0 and results[0].boxes is not None:
                             boxes = results[0].boxes
-                            detected_count = len(boxes)
-
                             for b in boxes:
-                                xyxy = b.xyxy[0].cpu().numpy().astype(int)
-                                x1, y1, x2, y2 = xyxy
-                                conf = float(b.conf[0].cpu().numpy())
                                 cls_id = int(b.cls[0].cpu().numpy())
                                 label = detector.names.get(cls_id, f"obj_{cls_id}")
 
-                                # Check if detection centroid is inside ROI polygon
+                                # STRICT CLASS FILTER: Ignore chair, tv, cup, etc. Only track enabled_classes
+                                if enabled_classes and label not in enabled_classes:
+                                    continue
+
+                                conf = float(b.conf[0].cpu().numpy())
+                                if conf < conf_threshold:
+                                    continue
+
+                                xyxy = b.xyxy[0].cpu().numpy().astype(int)
+                                x1, y1, x2, y2 = xyxy
+
+                                # Centroid for ROI calculation
                                 cx = int((x1 + x2) / 2)
-                                cy = int(y2) # Foot/ground contact point
+                                cy = int((y1 + y2) / 2)
+
                                 in_roi = False
                                 if roi_poly_np is not None:
                                     dist = cv2.pointPolygonTest(roi_poly_np, (float(cx), float(cy)), False)
                                     in_roi = (dist >= 0)
 
-                                if in_roi:
-                                    alert_in_roi = True
-                                    box_color = (0, 0, 255)
-                                    tag = f"ALERT: {label} {conf*100:.0f}% [IN ROI]"
-
-                                    # Emit real violation trigger to C++ engine (with 20s cooldown)
-                                    now = time.time()
-                                    if now - last_alert_time > 20.0:
-                                        last_alert_time = now
-                                        alert_payload = {
-                                            "camera_id": "CAM_01_BAY_GANTRY",
-                                            "use_case_id": "tt_crew_entering_below_tt",
-                                            "label": label,
-                                            "score": float(conf),
-                                            "boxes": [[float(x1), float(y1), float(x2), float(y2)]]
-                                        }
-                                        try:
-                                            with open("/tmp/video_engine_alert.json", "w") as f_alert:
-                                                json.dump(alert_payload, f_alert)
-                                            print(f"\n[ALERT-TRIGGER] >>> REAL VIOLATION IN ROI: {label} ({conf*100:.0f}%) -> Sent to C++ Engine! <<<")
-                                        except Exception:
-                                            pass
-                                else:
-                                    # Normal Detection: Draw clean CYAN box
-                                    box_color = (255, 200, 0)
-                                    tag = f"{label} {conf*100:.0f}%"
-
-                                cv2.rectangle(display, (x1, y1), (x2, y2), box_color, 2)
-                                # Tag label banner
-                                (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-                                cv2.rectangle(display, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), box_color, -1)
-                                cv2.putText(display, tag, (x1 + 3, max(12, y1 - 4)), 
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0) if not in_roi else (255, 255, 255), 1)
-                    except Exception as e:
+                                new_detections.append({
+                                    "box": (x1, y1, x2, y2),
+                                    "label": label,
+                                    "conf": conf,
+                                    "in_roi": in_roi,
+                                    "cx": cx,
+                                    "cy": cy,
+                                    "updated_at": time.time()
+                                })
+                        cached_detections = new_detections
+                    except Exception:
                         pass
 
-                # Draw Plain ROI boundary (Thin 1px line, NO green translucent fill!)
+                # Filter cached detections (retain active ones up to 0.6s to eliminate flickering)
+                now = time.time()
+                active_detections = [d for d in cached_detections if (now - d.get("updated_at", now)) < 0.6]
+
+                alert_in_roi = False
+                # Re-evaluate ROI on cached detections in case drawing points change
+                for d in active_detections:
+                    if roi_poly_np is not None:
+                        d["in_roi"] = (cv2.pointPolygonTest(roi_poly_np, (float(d["cx"]), float(d["cy"])), False) >= 0)
+                    if d["in_roi"]:
+                        alert_in_roi = True
+
+                detected_count = len(active_detections)
+
+                # RENDER SMOOTH BOUNDING BOXES ON EVERY FRAME (NO BLINKING)
+                for det in active_detections:
+                    x1, y1, x2, y2 = det["box"]
+                    label = det["label"]
+                    conf = det["conf"]
+                    in_roi = det["in_roi"]
+
+                    if in_roi:
+                        box_color = (0, 0, 255) # Bright RED for Intrusion
+                        tag = f"ALERT: {label} {conf*100:.0f}% [INTRUSION IN ROI]"
+
+                        # Emit real violation trigger to C++ engine (with 20s cooldown)
+                        if now - last_alert_time > 20.0:
+                            last_alert_time = now
+                            alert_payload = {
+                                "camera_id": camera_id,
+                                "use_case_id": use_case_id,
+                                "label": label,
+                                "score": float(conf),
+                                "boxes": [[float(x1), float(y1), float(x2), float(y2)]]
+                            }
+                            try:
+                                with open("/tmp/video_engine_alert.json", "w") as f_alert:
+                                    json.dump(alert_payload, f_alert)
+                                print(f"\n[ALERT-TRIGGER] >>> REAL INTRUSION VIOLATION: {label} ({conf*100:.0f}%) in ROI -> Sent to C++ Engine! <<<")
+                            except Exception:
+                                pass
+                    else:
+                        # Clean CYAN box for person outside monitored zone
+                        box_color = (255, 200, 0)
+                        tag = f"{label} {conf*100:.0f}%"
+
+                    # Draw box and label banner
+                    cv2.rectangle(display, (x1, y1), (x2, y2), box_color, 2)
+                    (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                    cv2.rectangle(display, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), box_color, -1)
+                    cv2.putText(display, tag, (x1 + 3, max(12, y1 - 4)), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255) if in_roi else (0, 0, 0), 1)
+
+                # Draw Plain ROI boundary (Thin 2px line, NO translucent tint!)
                 if show_roi and roi_poly_np is not None:
-                    # Clean, thin yellow/cyan boundary line
                     line_color = (0, 0, 255) if alert_in_roi else (0, 255, 255)
                     cv2.polylines(display, [roi_poly_np], isClosed=True, color=line_color, thickness=2)
                     
@@ -281,17 +364,19 @@ def main():
                     for pt in drawing_points:
                         cv2.circle(display, pt, 4, line_color, -1)
 
-                    # Subtle text tag on top corner
-                    cv2.putText(display, "MONITORED ROI ZONE", (drawing_points[0][0] + 5, drawing_points[0][1] + 18), 
+                    # ROI zone label
+                    roi_tag = "MONITORED ROI ZONE" if not alert_in_roi else "*** INTRUSION ACTIVE ***"
+                    cv2.putText(display, roi_tag, (drawing_points[0][0] + 5, drawing_points[0][1] + 18), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, line_color, 1)
 
                 # Draw Modern HUD Banner
                 banner_color = (0, 0, 160) if alert_in_roi else (25, 25, 25)
                 cv2.rectangle(display, (0, 0), (actual_w, 28), banner_color, -1)
-                hud_text = f"LIVE WEBCAM @ {fps_display:.1f} FPS | Detections: {detected_count}"
                 if alert_in_roi:
-                    hud_text += " | *** VIOLATION TRIGGERED IN ROI! ***"
-                cv2.putText(display, hud_text, (10, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+                    hud_text = f"LIVE WEBCAM @ {fps_display:.1f} FPS | Model: intrusion.onnx | *** INTRUSION VIOLATION IN ROI! ***"
+                else:
+                    hud_text = f"LIVE WEBCAM @ {fps_display:.1f} FPS | Model: intrusion.onnx | Filter: {','.join(enabled_classes)} | Detections: {detected_count}"
+                cv2.putText(display, hud_text, (10, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
 
                 # Bottom control guide
                 cv2.putText(display, "[Click: Draw ROI | 's': Save | 'r': Reset | 'h': Toggle ROI | 'q': Quit]", 
@@ -322,7 +407,7 @@ def main():
 
             if frame_count % (args.fps * 5) == 0:
                 fps_display = frame_count / (time.time() - t0)
-                print(f"[WEBCAM-FEEDER] Streaming @ {fps_display:.1f} FPS (Detections: {detected_count}, Alert: {alert_in_roi})")
+                print(f"[WEBCAM-FEEDER] Streaming @ {fps_display:.1f} FPS (Target Class: {enabled_classes}, Detections: {detected_count}, Alert: {alert_in_roi})")
 
     finally:
         if pipe_fd is not None:

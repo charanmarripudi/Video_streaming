@@ -4,6 +4,7 @@
 #include <iostream>
 #include <fcntl.h>
 #include <unistd.h>
+#include <poll.h>
 #include <cerrno>
 
 namespace engine::capture {
@@ -104,36 +105,45 @@ void StreamCapture::capture_loop(std::stop_token st) {
                 }
             }
             if (pipe_fd >= 0) {
-                size_t total_read = 0;
-                while (total_read < frame_bytes && !st.stop_requested()) {
-                    ssize_t n = read(pipe_fd, buffer_data->data() + total_read, frame_bytes - total_read);
-                    if (n > 0) {
-                        total_read += n;
-                    } else if (n == 0) {
-                        close(pipe_fd);
-                        pipe_fd = -1;
-                        break;
-                    } else {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            if (total_read > 0) {
-                                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                struct pollfd pfd{};
+                pfd.fd = pipe_fd;
+                pfd.events = POLLIN;
+                int pret = poll(&pfd, 1, 60);
+                if (pret > 0 && (pfd.revents & POLLIN)) {
+                    size_t total_read = 0;
+                    while (total_read < frame_bytes && !st.stop_requested()) {
+                        ssize_t n = read(pipe_fd, buffer_data->data() + total_read, frame_bytes - total_read);
+                        if (n > 0) {
+                            total_read += n;
+                        } else if (n == 0) {
+                            close(pipe_fd);
+                            pipe_fd = -1;
+                            break;
+                        } else {
+                            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                std::this_thread::sleep_for(std::chrono::microseconds(500));
                                 continue;
                             }
+                            break;
                         }
-                        break;
                     }
-                }
-                if (total_read == frame_bytes) {
-                    read_from_pipe = true;
+                    if (total_read == frame_bytes) {
+                        read_from_pipe = true;
+                    }
                 }
             }
         }
 
         if (!read_from_pipe) {
-            // Simulated BGR frame pattern (fallback)
-            (*buffer_data)[0] = static_cast<uint8_t>((f_idx * 5) % 255);
-            (*buffer_data)[1] = 175;
-            (*buffer_data)[2] = 210;
+            // Simulated dynamic BGR frame pattern (fallback)
+            uint8_t r = static_cast<uint8_t>((f_idx * 4) % 256);
+            uint8_t g = static_cast<uint8_t>(120);
+            uint8_t b = static_cast<uint8_t>(200);
+            for (size_t p = 0; p < frame_bytes; p += 3) {
+                (*buffer_data)[p] = b;
+                (*buffer_data)[p + 1] = g;
+                (*buffer_data)[p + 2] = r;
+            }
         }
 
         frame->data = buffer_data;
@@ -164,7 +174,9 @@ void StreamCapture::capture_loop(std::stop_token st) {
                       << " KB, State: " << stream_state_to_string(supervisor_->current_state()) << ")" << std::endl;
         }
 
-        std::this_thread::sleep_for(std::chrono::nanoseconds(frame_interval_ns));
+        if (!read_from_pipe) {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(frame_interval_ns));
+        }
     }
 
     if (pipe_fd >= 0) {
