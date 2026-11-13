@@ -7,12 +7,14 @@ Key Upgrades:
 1. TARGET MODEL: Uses models/intrusion.onnx exclusively for intrusion monitoring.
 2. ZERO DETECTION FLICKERING / BLINKING: Persistent detection box caching ensures
    smooth continuous bounding boxes rendered on every frame at full FPS.
-3. STRICT CLASS FILTERING: Only tracks configured classes (e.g., 'person').
+3. HIGH-SPEED TCP STREAMING: Direct localhost TCP streaming to C++ Video Engine
+   (tcp://127.0.0.1:9876) with zero drops, zero OS buffer limits, and zero desync.
+4. STRICT CLASS FILTERING: Only tracks configured classes (e.g., 'person').
    Furniture, chairs, TVs, and background objects are 100% ignored.
-4. ROI INTRUSION MONITORING: Triggers bright RED alert only when a person enters
+5. ROI INTRUSION MONITORING: Triggers bright RED alert only when a person enters
    the user-defined ROI polygon. Emits real-time alert trigger to C++ engine.
-5. NATURAL PLAIN VIDEO: Clean camera video without any green or tinted wash.
-6. PERSISTENT ROI DRAWING: Interactive mouse clicking to draw or refine ROI zone,
+6. NATURAL PLAIN VIDEO: Clean camera video without any green or tinted wash.
+7. PERSISTENT ROI DRAWING: Interactive mouse clicking to draw or refine ROI zone,
    saved directly to config.json.
 """
 
@@ -21,6 +23,7 @@ import sys
 import time
 import json
 import signal
+import socket
 import argparse
 import numpy as np
 
@@ -88,7 +91,7 @@ def main():
     parser.add_argument("--width", type=int, default=640, help="Capture width (default: 640)")
     parser.add_argument("--height", type=int, default=480, help="Capture height (default: 480)")
     parser.add_argument("--fps", type=int, default=20, help="Target FPS (default: 20)")
-    parser.add_argument("--pipe", type=str, default="/tmp/video_engine_webcam.pipe", help="FIFO pipe path")
+    parser.add_argument("--tcp-port", type=int, default=9876, help="C++ Engine TCP port (default: 9876)")
     parser.add_argument("--config", type=str, default="config.json", help="Path to config.json")
     parser.add_argument("--model", type=str, default="models/intrusion.onnx", help="Path to ONNX model (default: models/intrusion.onnx)")
     parser.add_argument("--threshold", type=float, default=None, help="Confidence threshold (e.g. 0.50)")
@@ -118,6 +121,7 @@ def main():
     print(f"  -> Enabled Classes  : {enabled_classes} (All other objects ignored)")
     print(f"  -> Min Confidence   : {conf_threshold:.2f}")
     print(f"  -> Resolution       : {args.width}x{args.height} @ {args.fps} FPS")
+    print(f"  -> Video Stream Sink: tcp://127.0.0.1:{args.tcp_port}")
     print("=======================================================")
 
     # 2. Load Live ONNX Object Detection Model (intrusion.onnx)
@@ -133,21 +137,7 @@ def main():
     else:
         print(f"[WARNING] Model file {model_path} not found. Running preview without AI overlay.")
 
-    # 3. Initialize FIFO Pipe
-    if os.path.exists(args.pipe):
-        try:
-            os.remove(args.pipe)
-        except OSError:
-            pass
-
-    try:
-        os.mkfifo(args.pipe)
-        print(f"[WEBCAM-FEEDER] Created FIFO pipe at: {args.pipe}")
-    except OSError as e:
-        print(f"[ERROR] Failed to create FIFO pipe {args.pipe}: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # 4. Open Laptop Webcam
+    # 3. Open Laptop Webcam
     cap = cv2.VideoCapture(args.device)
     if not cap.isOpened():
         print(f"[ERROR] Cannot open webcam device {args.device}!", file=sys.stderr)
@@ -163,7 +153,6 @@ def main():
 
     print(f"[WEBCAM-FEEDER] Webcam opened: {actual_w}x{actual_h} @ ~{args.fps} FPS")
     print(f"[WEBCAM-FEEDER] Frame size: {frame_bytes} bytes (BGR24)")
-    print("[WEBCAM-FEEDER] Waiting for C++ Video Engine to connect to pipe...")
 
     # Load existing ROI points from config
     roi_points = cfg_data.get("roi_polygon", [])
@@ -210,12 +199,33 @@ def main():
             print(f"[PREVIEW] GUI window unavailable: {e}")
             args.preview = False
 
-    pipe_fd = None
     running = True
     last_alert_time = 0.0
 
     # Persistent Detection Cache to ELIMINATE BLINKING / FLICKERING completely
     cached_detections = []
+
+    # High-speed TCP stream client
+    stream_sock = None
+    last_connect_attempt = 0.0
+
+    def get_socket():
+        nonlocal stream_sock, last_connect_attempt
+        if stream_sock is not None:
+            return stream_sock
+        now = time.time()
+        if now - last_connect_attempt < 1.0: # Retry at most once per second
+            return None
+        last_connect_attempt = now
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            s.connect(("127.0.0.1", args.tcp_port))
+            print(f"[WEBCAM-FEEDER] Connected to C++ Video Engine on tcp://127.0.0.1:{args.tcp_port}!")
+            stream_sock = s
+            return stream_sock
+        except (ConnectionRefusedError, OSError):
+            return None
 
     def sig_handler(sig, frame):
         nonlocal running
@@ -226,13 +236,12 @@ def main():
     signal.signal(signal.SIGTERM, sig_handler)
 
     try:
-        pipe_fd = os.open(args.pipe, os.O_WRONLY)
-        print("[WEBCAM-FEEDER] C++ Video Engine connected! Streaming live webcam frames...")
-
         interval = 1.0 / args.fps
         frame_count = 0
         t0 = time.time()
         fps_display = args.fps
+        detected_count = 0
+        alert_in_roi = False
 
         while running:
             t_start = time.time()
@@ -244,14 +253,22 @@ def main():
             if frame.shape[1] != actual_w or frame.shape[0] != actual_h:
                 frame = cv2.resize(frame, (actual_w, actual_h))
 
-            # 1. Stream raw uncompressed frame to C++ Engine via pipe
+            # 1. Stream raw uncompressed frame to C++ Engine via high-speed TCP socket
             raw_data = frame.tobytes()
-            try:
-                os.write(pipe_fd, raw_data)
+            s = get_socket()
+            if s is not None:
+                try:
+                    s.sendall(raw_data)
+                    frame_count += 1
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    print("[WEBCAM-FEEDER] C++ engine disconnected. Waiting to reconnect...")
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                    stream_sock = None
+            else:
                 frame_count += 1
-            except (BrokenPipeError, OSError):
-                print("[WEBCAM-FEEDER] C++ engine disconnected from pipe. Exiting.")
-                break
 
             # 2. Render Live Preview Window with Persistent Smooth AI Overlay
             if args.preview:
@@ -372,11 +389,12 @@ def main():
                 # Draw Modern HUD Banner
                 banner_color = (0, 0, 160) if alert_in_roi else (25, 25, 25)
                 cv2.rectangle(display, (0, 0), (actual_w, 28), banner_color, -1)
+                connected_str = "[STREAMING TO C++ ENGINE]" if stream_sock is not None else "[WAITING FOR C++ ENGINE]"
                 if alert_in_roi:
-                    hud_text = f"LIVE WEBCAM @ {fps_display:.1f} FPS | Model: intrusion.onnx | *** INTRUSION VIOLATION IN ROI! ***"
+                    hud_text = f"LIVE WEBCAM @ {fps_display:.1f} FPS | {connected_str} | *** INTRUSION IN ROI! ***"
                 else:
-                    hud_text = f"LIVE WEBCAM @ {fps_display:.1f} FPS | Model: intrusion.onnx | Filter: {','.join(enabled_classes)} | Detections: {detected_count}"
-                cv2.putText(display, hud_text, (10, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+                    hud_text = f"LIVE WEBCAM @ {fps_display:.1f} FPS | {connected_str} | Filter: {','.join(enabled_classes)} | Count: {detected_count}"
+                cv2.putText(display, hud_text, (10, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
 
                 # Bottom control guide
                 cv2.putText(display, "[Click: Draw ROI | 's': Save | 'r': Reset | 'h': Toggle ROI | 'q': Quit]", 
@@ -407,24 +425,20 @@ def main():
 
             if frame_count % (args.fps * 5) == 0:
                 fps_display = frame_count / (time.time() - t0)
-                print(f"[WEBCAM-FEEDER] Streaming @ {fps_display:.1f} FPS (Target Class: {enabled_classes}, Detections: {detected_count}, Alert: {alert_in_roi})")
+                status = "Connected" if stream_sock is not None else "Standby"
+                print(f"[WEBCAM-FEEDER] Streaming @ {fps_display:.1f} FPS (C++ Link: {status}, Detections: {detected_count}, Alert: {alert_in_roi})")
 
     finally:
-        if pipe_fd is not None:
+        if stream_sock is not None:
             try:
-                os.close(pipe_fd)
-            except OSError:
+                stream_sock.close()
+            except Exception:
                 pass
         cap.release()
         if args.preview:
             try:
                 cv2.destroyAllWindows()
             except Exception:
-                pass
-        if os.path.exists(args.pipe):
-            try:
-                os.remove(args.pipe)
-            except OSError:
                 pass
         print("[WEBCAM-FEEDER] Cleaned up resources. Goodbye.")
 

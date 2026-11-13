@@ -6,6 +6,10 @@
 #include <unistd.h>
 #include <poll.h>
 #include <cerrno>
+#include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 namespace engine::capture {
 
@@ -65,13 +69,32 @@ void StreamCapture::capture_loop(std::stop_token st) {
     int64_t current_pts_ns = 0;
     const size_t frame_bytes = static_cast<size_t>(config_.capture_width * config_.capture_height * 3);
 
-    // Support live webcam / external pipe ingestion
-    int pipe_fd = -1;
+    // Support live webcam / TCP stream ingestion
+    int server_fd = -1;
+    int client_fd = -1;
     bool is_webcam_mode = (config_.stream_url.rfind("webcam", 0) == 0 || 
-                           config_.stream_url.find(".pipe") != std::string::npos);
-    std::string pipe_path = "/tmp/video_engine_webcam.pipe";
-    if (config_.stream_url.find(".pipe") != std::string::npos) {
-        pipe_path = config_.stream_url;
+                           config_.stream_url.find(".pipe") != std::string::npos ||
+                           config_.stream_url.find("tcp://") != std::string::npos);
+
+    if (is_webcam_mode) {
+        server_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd >= 0) {
+            int opt = 1;
+            setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+            addr.sin_port = htons(9876);
+            if (bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+                listen(server_fd, 1);
+                fcntl(server_fd, F_SETFL, O_NONBLOCK);
+                std::cout << "[CAPTURE][" << config_.id << "] Listening for live webcam stream on tcp://127.0.0.1:9876" << std::endl;
+            } else {
+                std::cerr << "[CAPTURE][" << config_.id << "] Note: Port 9876 bind: " << strerror(errno) << std::endl;
+                close(server_fd);
+                server_fd = -1;
+            }
+        }
     }
 
     while (!st.stop_requested()) {
@@ -85,7 +108,7 @@ void StreamCapture::capture_loop(std::stop_token st) {
         int64_t f_idx = ++frame_counter_;
         bool is_key = (f_idx % 30 == 1); // 1 keyframe every 30 frames (1-2s GOP)
 
-        // 1. Decoded Frame: Read live pixels from webcam pipe (or fallback test pattern)
+        // 1. Decoded Frame: Read live pixels from webcam TCP socket (or fallback test pattern)
         auto frame = std::make_shared<Frame>();
         frame->frame_index = f_idx;
         frame->pts_ns = current_pts_ns;
@@ -98,51 +121,57 @@ void StreamCapture::capture_loop(std::stop_token st) {
         bool read_from_pipe = false;
 
         if (is_webcam_mode) {
-            if (pipe_fd < 0) {
-                pipe_fd = open(pipe_path.c_str(), O_RDONLY | O_NONBLOCK);
-                if (pipe_fd >= 0) {
-                    std::cout << "[CAPTURE][" << config_.id << "] Connected to live webcam pipe: " << pipe_path << std::endl;
+            if (client_fd < 0 && server_fd >= 0) {
+                sockaddr_in c_addr{};
+                socklen_t c_len = sizeof(c_addr);
+                client_fd = accept(server_fd, reinterpret_cast<sockaddr*>(&c_addr), &c_len);
+                if (client_fd >= 0) {
+                    int flags = fcntl(client_fd, F_GETFL, 0);
+                    fcntl(client_fd, F_SETFL, flags & ~O_NONBLOCK); // Ensure blocking I/O for clean frame reads
+                    struct timeval tv{};
+                    tv.tv_sec = 0;
+                    tv.tv_usec = 150000; // 150ms socket read timeout
+                    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                    int buf_size = 4 * 1024 * 1024; // 4MB buffer
+                    setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+                    std::cout << "[CAPTURE][" << config_.id << "] Live webcam stream connected on tcp://127.0.0.1:9876!" << std::endl;
                 }
             }
-            if (pipe_fd >= 0) {
-                struct pollfd pfd{};
-                pfd.fd = pipe_fd;
-                pfd.events = POLLIN;
-                int pret = poll(&pfd, 1, 60);
-                if (pret > 0 && (pfd.revents & POLLIN)) {
-                    size_t total_read = 0;
-                    while (total_read < frame_bytes && !st.stop_requested()) {
-                        ssize_t n = read(pipe_fd, buffer_data->data() + total_read, frame_bytes - total_read);
-                        if (n > 0) {
-                            total_read += n;
-                        } else if (n == 0) {
-                            close(pipe_fd);
-                            pipe_fd = -1;
-                            break;
-                        } else {
-                            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                std::this_thread::sleep_for(std::chrono::microseconds(500));
+            if (client_fd >= 0) {
+                size_t total_read = 0;
+                while (total_read < frame_bytes && !st.stop_requested()) {
+                    ssize_t n = recv(client_fd, buffer_data->data() + total_read, frame_bytes - total_read, 0);
+                    if (n > 0) {
+                        total_read += n;
+                    } else if (n == 0) {
+                        std::cout << "[CAPTURE][" << config_.id << "] Live webcam client disconnected." << std::endl;
+                        close(client_fd);
+                        client_fd = -1;
+                        break;
+                    } else {
+                        // Timeout or error
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            if (total_read > 0) {
                                 continue;
                             }
-                            break;
                         }
+                        close(client_fd);
+                        client_fd = -1;
+                        break;
                     }
-                    if (total_read == frame_bytes) {
-                        read_from_pipe = true;
-                    }
+                }
+                if (total_read == frame_bytes) {
+                    read_from_pipe = true;
                 }
             }
         }
 
         if (!read_from_pipe) {
-            // Simulated dynamic BGR frame pattern (fallback)
-            uint8_t r = static_cast<uint8_t>((f_idx * 4) % 256);
-            uint8_t g = static_cast<uint8_t>(120);
-            uint8_t b = static_cast<uint8_t>(200);
+            // Calm static industrial dark slate standby pattern (NO FLICKERING / ZERO FLASHING)
             for (size_t p = 0; p < frame_bytes; p += 3) {
-                (*buffer_data)[p] = b;
-                (*buffer_data)[p + 1] = g;
-                (*buffer_data)[p + 2] = r;
+                (*buffer_data)[p] = 45;     // B
+                (*buffer_data)[p + 1] = 40; // G
+                (*buffer_data)[p + 2] = 40; // R
             }
         }
 
@@ -179,8 +208,11 @@ void StreamCapture::capture_loop(std::stop_token st) {
         }
     }
 
-    if (pipe_fd >= 0) {
-        close(pipe_fd);
+    if (client_fd >= 0) {
+        close(client_fd);
+    }
+    if (server_fd >= 0) {
+        close(server_fd);
     }
 }
 
