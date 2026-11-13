@@ -179,19 +179,21 @@ void StreamCapture::capture_loop(std::stop_token st) {
         latest_slot_->publish(frame);
 
         // 2. Encoded Tee: Push REAL frame into Pre-Event Ring and Event Manager
-        EncodedSample sample;
-        sample.pts_ns = current_pts_ns;
-        sample.dts_ns = current_pts_ns;
-        sample.is_keyframe = is_key;
-        sample.payload = buffer_data; // Store actual webcam frame!
+        if (read_from_pipe) {
+            EncodedSample sample;
+            sample.pts_ns = current_pts_ns;
+            sample.dts_ns = current_pts_ns;
+            sample.is_keyframe = is_key;
+            sample.payload = buffer_data; // Store actual webcam frame!
 
-        if (pre_event_ring_) {
-            pre_event_ring_->push(sample);
-        }
+            if (pre_event_ring_) {
+                pre_event_ring_->push(sample);
+            }
 
-        // Notify EventManager for post-event accumulation on open clips
-        if (event_mgr_) {
-            event_mgr_->on_encoded_sample(sample);
+            // Notify EventManager for post-event accumulation on open clips
+            if (event_mgr_) {
+                event_mgr_->on_encoded_sample(sample);
+            }
         }
 
         // Periodic log & watchdog health check

@@ -253,12 +253,137 @@ def main():
             if frame.shape[1] != actual_w or frame.shape[0] != actual_h:
                 frame = cv2.resize(frame, (actual_w, actual_h))
 
-            # 1. Stream raw uncompressed frame to C++ Engine via high-speed TCP socket
-            raw_data = frame.tobytes()
+            # 1. Prepare Annotated AI Display Frame (Boxes, ROI, HUD Banner)
+            display = frame.copy()
+            roi_poly_np = np.array(drawing_points, np.int32).reshape((-1, 1, 2)) if len(drawing_points) >= 3 else None
+
+            # Run Inference periodically (every 2 frames) to conserve CPU while updating cache
+            if detector is not None and frame_count % 2 == 0:
+                try:
+                    results = detector(frame, verbose=False, conf=conf_threshold)
+                    new_detections = []
+                    if len(results) > 0 and results[0].boxes is not None:
+                        boxes = results[0].boxes
+                        for b in boxes:
+                            cls_id = int(b.cls[0].cpu().numpy())
+                            label = detector.names.get(cls_id, f"obj_{cls_id}")
+
+                            # STRICT CLASS FILTER: Ignore chair, tv, cup, etc. Only track enabled_classes
+                            if enabled_classes and label not in enabled_classes:
+                                continue
+
+                            conf = float(b.conf[0].cpu().numpy())
+                            if conf < conf_threshold:
+                                continue
+
+                            xyxy = b.xyxy[0].cpu().numpy().astype(int)
+                            x1, y1, x2, y2 = xyxy
+
+                            # Centroid for ROI calculation
+                            cx = int((x1 + x2) / 2)
+                            cy = int((y1 + y2) / 2)
+
+                            in_roi = False
+                            if roi_poly_np is not None:
+                                dist = cv2.pointPolygonTest(roi_poly_np, (float(cx), float(cy)), False)
+                                in_roi = (dist >= 0)
+
+                            new_detections.append({
+                                "box": (x1, y1, x2, y2),
+                                "label": label,
+                                "conf": conf,
+                                "in_roi": in_roi,
+                                "cx": cx,
+                                "cy": cy,
+                                "updated_at": time.time()
+                            })
+                    cached_detections = new_detections
+                except Exception:
+                    pass
+
+            # Filter cached detections (retain active ones up to 0.6s to eliminate flickering)
+            now = time.time()
+            active_detections = [d for d in cached_detections if (now - d.get("updated_at", now)) < 0.6]
+
+            alert_in_roi = False
+            # Re-evaluate ROI on cached detections in case drawing points change
+            for d in active_detections:
+                if roi_poly_np is not None:
+                    d["in_roi"] = (cv2.pointPolygonTest(roi_poly_np, (float(d["cx"]), float(d["cy"])), False) >= 0)
+                if d["in_roi"]:
+                    alert_in_roi = True
+
+            detected_count = len(active_detections)
+
+            # RENDER SMOOTH BOUNDING BOXES ON EVERY FRAME (NO BLINKING)
+            for det in active_detections:
+                x1, y1, x2, y2 = det["box"]
+                label = det["label"]
+                conf = det["conf"]
+                in_roi = det["in_roi"]
+
+                if in_roi:
+                    box_color = (0, 0, 255) # Bright RED for Intrusion
+                    tag = f"ALERT: {label} {conf*100:.0f}% [INTRUSION IN ROI]"
+
+                    # Emit real violation trigger to C++ engine (with 20s cooldown)
+                    if now - last_alert_time > 20.0:
+                        last_alert_time = now
+                        alert_payload = {
+                            "camera_id": camera_id,
+                            "use_case_id": use_case_id,
+                            "label": label,
+                            "score": float(conf),
+                            "boxes": [[float(x1), float(y1), float(x2), float(y2)]]
+                        }
+                        try:
+                            with open("/tmp/video_engine_alert.json", "w") as f_alert:
+                                json.dump(alert_payload, f_alert)
+                            print(f"\n[ALERT-TRIGGER] >>> REAL INTRUSION VIOLATION: {label} ({conf*100:.0f}%) in ROI -> Sent to C++ Engine! <<<")
+                        except Exception:
+                            pass
+                else:
+                    # Clean CYAN box for person outside monitored zone
+                    box_color = (255, 200, 0)
+                    tag = f"{label} {conf*100:.0f}%"
+
+                # Draw box and label banner
+                cv2.rectangle(display, (x1, y1), (x2, y2), box_color, 2)
+                (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                cv2.rectangle(display, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), box_color, -1)
+                cv2.putText(display, tag, (x1 + 3, max(12, y1 - 4)), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255) if in_roi else (0, 0, 0), 1)
+
+            # Draw Plain ROI boundary (Thin 2px line, NO translucent tint!)
+            if show_roi and roi_poly_np is not None:
+                line_color = (0, 0, 255) if alert_in_roi else (0, 255, 255)
+                cv2.polylines(display, [roi_poly_np], isClosed=True, color=line_color, thickness=2)
+                
+                # Corner anchor dots
+                for pt in drawing_points:
+                    cv2.circle(display, pt, 4, line_color, -1)
+
+                # ROI zone label
+                roi_tag = "MONITORED ROI ZONE" if not alert_in_roi else "*** INTRUSION ACTIVE ***"
+                cv2.putText(display, roi_tag, (drawing_points[0][0] + 5, drawing_points[0][1] + 18), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, line_color, 1)
+
+            # Draw Modern HUD Banner
+            banner_color = (0, 0, 160) if alert_in_roi else (25, 25, 25)
+            cv2.rectangle(display, (0, 0), (actual_w, 28), banner_color, -1)
+            connected_str = "[STREAMING TO C++ ENGINE]" if stream_sock is not None else "[WAITING FOR C++ ENGINE]"
+            if alert_in_roi:
+                hud_text = f"LIVE WEBCAM @ {fps_display:.1f} FPS | {connected_str} | *** INTRUSION IN ROI! ***"
+            else:
+                hud_text = f"LIVE WEBCAM @ {fps_display:.1f} FPS | {connected_str} | Filter: {','.join(enabled_classes)} | Count: {detected_count}"
+            cv2.putText(display, hud_text, (10, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
+
+            # 2. Stream Annotated Frame to C++ Video Engine (Records video with bounding boxes!)
+            stream_data = display.tobytes()
             s = get_socket()
             if s is not None:
                 try:
-                    s.sendall(raw_data)
+                    s.sendall(stream_data)
                     frame_count += 1
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     print("[WEBCAM-FEEDER] C++ engine disconnected. Waiting to reconnect...")
@@ -270,132 +395,8 @@ def main():
             else:
                 frame_count += 1
 
-            # 2. Render Live Preview Window with Persistent Smooth AI Overlay
+            # 3. Render GUI Window (if preview enabled)
             if args.preview:
-                display = frame.copy()
-                roi_poly_np = np.array(drawing_points, np.int32).reshape((-1, 1, 2)) if len(drawing_points) >= 3 else None
-
-                # Run Inference periodically (every 2 frames) to conserve CPU while updating cache
-                if detector is not None and frame_count % 2 == 0:
-                    try:
-                        results = detector(frame, verbose=False, conf=conf_threshold)
-                        new_detections = []
-                        if len(results) > 0 and results[0].boxes is not None:
-                            boxes = results[0].boxes
-                            for b in boxes:
-                                cls_id = int(b.cls[0].cpu().numpy())
-                                label = detector.names.get(cls_id, f"obj_{cls_id}")
-
-                                # STRICT CLASS FILTER: Ignore chair, tv, cup, etc. Only track enabled_classes
-                                if enabled_classes and label not in enabled_classes:
-                                    continue
-
-                                conf = float(b.conf[0].cpu().numpy())
-                                if conf < conf_threshold:
-                                    continue
-
-                                xyxy = b.xyxy[0].cpu().numpy().astype(int)
-                                x1, y1, x2, y2 = xyxy
-
-                                # Centroid for ROI calculation
-                                cx = int((x1 + x2) / 2)
-                                cy = int((y1 + y2) / 2)
-
-                                in_roi = False
-                                if roi_poly_np is not None:
-                                    dist = cv2.pointPolygonTest(roi_poly_np, (float(cx), float(cy)), False)
-                                    in_roi = (dist >= 0)
-
-                                new_detections.append({
-                                    "box": (x1, y1, x2, y2),
-                                    "label": label,
-                                    "conf": conf,
-                                    "in_roi": in_roi,
-                                    "cx": cx,
-                                    "cy": cy,
-                                    "updated_at": time.time()
-                                })
-                        cached_detections = new_detections
-                    except Exception:
-                        pass
-
-                # Filter cached detections (retain active ones up to 0.6s to eliminate flickering)
-                now = time.time()
-                active_detections = [d for d in cached_detections if (now - d.get("updated_at", now)) < 0.6]
-
-                alert_in_roi = False
-                # Re-evaluate ROI on cached detections in case drawing points change
-                for d in active_detections:
-                    if roi_poly_np is not None:
-                        d["in_roi"] = (cv2.pointPolygonTest(roi_poly_np, (float(d["cx"]), float(d["cy"])), False) >= 0)
-                    if d["in_roi"]:
-                        alert_in_roi = True
-
-                detected_count = len(active_detections)
-
-                # RENDER SMOOTH BOUNDING BOXES ON EVERY FRAME (NO BLINKING)
-                for det in active_detections:
-                    x1, y1, x2, y2 = det["box"]
-                    label = det["label"]
-                    conf = det["conf"]
-                    in_roi = det["in_roi"]
-
-                    if in_roi:
-                        box_color = (0, 0, 255) # Bright RED for Intrusion
-                        tag = f"ALERT: {label} {conf*100:.0f}% [INTRUSION IN ROI]"
-
-                        # Emit real violation trigger to C++ engine (with 20s cooldown)
-                        if now - last_alert_time > 20.0:
-                            last_alert_time = now
-                            alert_payload = {
-                                "camera_id": camera_id,
-                                "use_case_id": use_case_id,
-                                "label": label,
-                                "score": float(conf),
-                                "boxes": [[float(x1), float(y1), float(x2), float(y2)]]
-                            }
-                            try:
-                                with open("/tmp/video_engine_alert.json", "w") as f_alert:
-                                    json.dump(alert_payload, f_alert)
-                                print(f"\n[ALERT-TRIGGER] >>> REAL INTRUSION VIOLATION: {label} ({conf*100:.0f}%) in ROI -> Sent to C++ Engine! <<<")
-                            except Exception:
-                                pass
-                    else:
-                        # Clean CYAN box for person outside monitored zone
-                        box_color = (255, 200, 0)
-                        tag = f"{label} {conf*100:.0f}%"
-
-                    # Draw box and label banner
-                    cv2.rectangle(display, (x1, y1), (x2, y2), box_color, 2)
-                    (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-                    cv2.rectangle(display, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), box_color, -1)
-                    cv2.putText(display, tag, (x1 + 3, max(12, y1 - 4)), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255) if in_roi else (0, 0, 0), 1)
-
-                # Draw Plain ROI boundary (Thin 2px line, NO translucent tint!)
-                if show_roi and roi_poly_np is not None:
-                    line_color = (0, 0, 255) if alert_in_roi else (0, 255, 255)
-                    cv2.polylines(display, [roi_poly_np], isClosed=True, color=line_color, thickness=2)
-                    
-                    # Corner anchor dots
-                    for pt in drawing_points:
-                        cv2.circle(display, pt, 4, line_color, -1)
-
-                    # ROI zone label
-                    roi_tag = "MONITORED ROI ZONE" if not alert_in_roi else "*** INTRUSION ACTIVE ***"
-                    cv2.putText(display, roi_tag, (drawing_points[0][0] + 5, drawing_points[0][1] + 18), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, line_color, 1)
-
-                # Draw Modern HUD Banner
-                banner_color = (0, 0, 160) if alert_in_roi else (25, 25, 25)
-                cv2.rectangle(display, (0, 0), (actual_w, 28), banner_color, -1)
-                connected_str = "[STREAMING TO C++ ENGINE]" if stream_sock is not None else "[WAITING FOR C++ ENGINE]"
-                if alert_in_roi:
-                    hud_text = f"LIVE WEBCAM @ {fps_display:.1f} FPS | {connected_str} | *** INTRUSION IN ROI! ***"
-                else:
-                    hud_text = f"LIVE WEBCAM @ {fps_display:.1f} FPS | {connected_str} | Filter: {','.join(enabled_classes)} | Count: {detected_count}"
-                cv2.putText(display, hud_text, (10, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
-
                 # Bottom control guide
                 cv2.putText(display, "[Click: Draw ROI | 's': Save | 'r': Reset | 'h': Toggle ROI | 'q': Quit]", 
                             (10, actual_h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 220, 255), 1)
