@@ -74,3 +74,4 @@ if __name__ == "__main__":
 
     success = create_playable_mp4(out_p, w, h, f, count)
     sys.exit(0 if success else 1)
+

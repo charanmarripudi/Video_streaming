@@ -11,9 +11,8 @@ CameraContext::CameraContext(CameraConfig config, int global_fps, uint64_t min_f
     // 1. Lock-free Latest Frame Slot
     latest_slot_ = std::make_shared<LatestFrameSlot>();
 
-    // 2. Pre-Event Ring Buffer (Encoded-GOP storage bounded by bytes!)
-    // e.g. 15s pre-event @ 2-8 Mbps = ~10 MB RAM budget
-    size_t ring_max_bytes = 16 * 1024 * 1024; // 16 MB ceiling per camera
+    // 2. Pre-Event Ring Buffer (stores up to 15s pre-event window)
+    size_t ring_max_bytes = 350 * 1024 * 1024; // 350 MB budget for local frames
     int64_t window_ns = static_cast<int64_t>(config_.event_config.pre_event_s) * 1000000000LL;
     pre_event_ring_ = std::make_shared<buffer::PreEventRing>(ring_max_bytes, window_ns);
 

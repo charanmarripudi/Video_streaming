@@ -4,9 +4,13 @@
 #include <vector>
 #include <string>
 #include <iostream>
+#include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include "json.hpp"
 #include "common/types.hpp"
+
+using json = nlohmann::json;
 
 namespace engine::inference {
 
@@ -28,38 +32,37 @@ public:
         std::vector<BoundingBox> detections;
         if (!frame || !frame->is_valid()) return detections;
 
-        // Model Execution & Violation Rule Evaluation
-        // In full production, this executes Ort::Session::Run() tensor inference
-        if (config_.use_case_id == "tt_crew_entering_below_tt") {
-            if (frame->frame_index > 0 && frame->frame_index % 150 == 0) {
-                maybe_add_box(detections, {100.0f, 200.0f, 400.0f, 600.0f, "person", 0.88f});
-                maybe_add_box(detections, {50.0f, 150.0f, 800.0f, 650.0f, "truck", 0.94f});
-            }
-        } 
-        else if (config_.use_case_id == "tt_crew_non_availability") {
-            if (frame->frame_index > 0 && frame->frame_index % 250 == 0) {
-                maybe_add_box(detections, {80.0f, 180.0f, 750.0f, 620.0f, "no-TT_Crew_Availability", 0.91f});
-            }
-        }
-        else if (config_.use_case_id == "fuel_spillage_detection" || config_.use_case_id == "spillage") {
-            if (frame->frame_index > 0 && frame->frame_index % 180 == 0) {
-                maybe_add_box(detections, {350.0f, 500.0f, 620.0f, 680.0f, "spillage", 0.85f});
-            }
-        }
-        else if (config_.use_case_id == "fire_smoke") {
-            if (frame->frame_index > 0 && frame->frame_index % 300 == 0) {
-                maybe_add_box(detections, {200.0f, 100.0f, 450.0f, 350.0f, "smoke", 0.82f});
-            }
-        }
-        else if (config_.use_case_id == "intrusion" || config_.use_case_id == "vehicle_intrusion") {
-            if (frame->frame_index > 0 && frame->frame_index % 220 == 0) {
-                maybe_add_box(detections, {120.0f, 220.0f, 380.0f, 590.0f, "person", 0.79f});
-            }
-        }
-        else if (config_.use_case_id == "ppe") {
-            if (frame->frame_index > 0 && frame->frame_index % 140 == 0) {
-                maybe_add_box(detections, {210.0f, 80.0f, 320.0f, 200.0f, "no_helmet", 0.87f});
-            }
+        // Ingest real-time violation trigger from live AI detector
+        std::string alert_path = "/tmp/video_engine_alert.json";
+        if (std::filesystem::exists(alert_path)) {
+            try {
+                std::ifstream f(alert_path);
+                if (f.is_open()) {
+                    auto j = json::parse(f);
+                    f.close();
+                    std::error_code ec;
+                    std::filesystem::remove(alert_path, ec); // consume trigger
+
+                    std::string alert_uc = j.value("use_case_id", "");
+                    if (alert_uc.empty() || alert_uc == config_.use_case_id) {
+                        float score = j.value("score", 0.88f);
+                        std::string label = j.value("label", "person");
+                        if (j.contains("boxes") && j["boxes"].is_array()) {
+                            for (const auto& b : j["boxes"]) {
+                                if (b.is_array() && b.size() >= 4) {
+                                    maybe_add_box(detections, {
+                                        b[0].get<float>(), b[1].get<float>(),
+                                        b[2].get<float>(), b[3].get<float>(),
+                                        label, score, true
+                                    });
+                                }
+                            }
+                        } else {
+                            maybe_add_box(detections, {150.0f, 150.0f, 450.0f, 450.0f, label, score, true});
+                        }
+                    }
+                }
+            } catch (...) {}
         }
 
         return detections;

@@ -84,25 +84,7 @@ void StreamCapture::capture_loop(std::stop_token st) {
         int64_t f_idx = ++frame_counter_;
         bool is_key = (f_idx % 30 == 1); // 1 keyframe every 30 frames (1-2s GOP)
 
-        // 2. Encoded Tee: Push compressed NAL unit into Pre-Event Ring before decode (Saves 99% RAM!)
-        EncodedSample sample;
-        sample.pts_ns = current_pts_ns;
-        sample.dts_ns = current_pts_ns;
-        sample.is_keyframe = is_key;
-        // Lightweight compressed NAL unit (approx 15-40 KB per frame vs 3MB uncompressed!)
-        size_t compressed_bytes = is_key ? 45000 : 8000;
-        sample.payload = std::make_shared<const std::vector<uint8_t>>(compressed_bytes, 0xAA);
-
-        if (pre_event_ring_) {
-            pre_event_ring_->push(sample);
-        }
-
-        // Notify EventManager for post-event accumulation on open clips
-        if (event_mgr_) {
-            event_mgr_->on_encoded_sample(sample);
-        }
-
-        // 3. Decoded Frame: Publish to Lock-Free LatestFrameSlot (Zero-Copy & Zero Mutex!)
+        // 1. Decoded Frame: Read live pixels from webcam pipe (or fallback test pattern)
         auto frame = std::make_shared<Frame>();
         frame->frame_index = f_idx;
         frame->pts_ns = current_pts_ns;
@@ -156,6 +138,22 @@ void StreamCapture::capture_loop(std::stop_token st) {
 
         frame->data = buffer_data;
         latest_slot_->publish(frame);
+
+        // 2. Encoded Tee: Push REAL frame into Pre-Event Ring and Event Manager
+        EncodedSample sample;
+        sample.pts_ns = current_pts_ns;
+        sample.dts_ns = current_pts_ns;
+        sample.is_keyframe = is_key;
+        sample.payload = buffer_data; // Store actual webcam frame!
+
+        if (pre_event_ring_) {
+            pre_event_ring_->push(sample);
+        }
+
+        // Notify EventManager for post-event accumulation on open clips
+        if (event_mgr_) {
+            event_mgr_->on_encoded_sample(sample);
+        }
 
         // Periodic log & watchdog health check
         if (f_idx % (effective_fps_ * 5) == 0) {

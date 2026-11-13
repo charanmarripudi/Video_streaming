@@ -163,23 +163,17 @@ void EventManager::finalize_and_persist_clip(ActiveClip clip) {
         meta_out << meta_json.dump(2);
     } catch (...) {}
 
-    // 2. Atomic persistence of media payload: write to temp file then rename
-    std::string temp_path = clip.output_path + ".tmp";
+    // 2. Dump raw pre-event and post-event frames for ISO MP4 muxer
+    std::string raw_path = clip.output_path + ".raw";
     {
-        std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
-        
-        // Write standard Annex-B H.264 binary stream with NAL delimiters
+        std::ofstream out(raw_path, std::ios::binary | std::ios::trunc);
         for (const auto& s : clip.pre_event_samples) {
             if (s.payload && !s.payload->empty()) {
-                const uint8_t nal_delim[4] = {0x00, 0x00, 0x00, 0x01};
-                out.write(reinterpret_cast<const char*>(nal_delim), 4);
                 out.write(reinterpret_cast<const char*>(s.payload->data()), s.payload->size());
             }
         }
         for (const auto& s : clip.post_event_samples) {
             if (s.payload && !s.payload->empty()) {
-                const uint8_t nal_delim[4] = {0x00, 0x00, 0x00, 0x01};
-                out.write(reinterpret_cast<const char*>(nal_delim), 4);
                 out.write(reinterpret_cast<const char*>(s.payload->data()), s.payload->size());
             }
         }
@@ -193,13 +187,7 @@ void EventManager::finalize_and_persist_clip(ActiveClip clip) {
                         + std::to_string(clip.height) + " " 
                         + std::to_string(clip.output_fps) + " " 
                         + std::to_string(total_samples) + " > /dev/null 2>&1";
-    int mux_ret = std::system(mux_cmd.c_str());
-    if (mux_ret != 0) {
-        std::filesystem::rename(temp_path, clip.output_path);
-    } else {
-        std::error_code ec;
-        std::filesystem::remove(temp_path, ec);
-    }
+    std::system(mux_cmd.c_str());
 
     std::cout << "[EVENT-MANAGER][" << clip.camera_id << "] CLIP SEALED & PERSISTED (Playable ISO MP4):\n"
               << "  -> Video Stream : " << clip.output_path << " (" << total_samples << " packets, " 

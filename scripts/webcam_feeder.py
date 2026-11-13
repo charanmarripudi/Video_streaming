@@ -66,6 +66,7 @@ def main():
     parser.add_argument("--config", type=str, default="config.json", help="Path to config.json")
     parser.add_argument("--model", type=str, default="models/yolov8n.onnx", help="Path to ONNX model")
     parser.add_argument("--preview", action="store_true", default=True, help="Show live OpenCV preview window")
+    parser.add_argument("--no-preview", dest="preview", action="store_false", help="Disable live preview window")
     args = parser.parse_args()
 
     try:
@@ -165,6 +166,7 @@ def main():
 
     pipe_fd = None
     running = True
+    last_alert_time = 0.0
 
     def sig_handler(sig, frame):
         nonlocal running
@@ -235,9 +237,26 @@ def main():
 
                                 if in_roi:
                                     alert_in_roi = True
-                                    # VIOLATION: Draw bold RED box
                                     box_color = (0, 0, 255)
                                     tag = f"ALERT: {label} {conf*100:.0f}% [IN ROI]"
+
+                                    # Emit real violation trigger to C++ engine (with 20s cooldown)
+                                    now = time.time()
+                                    if now - last_alert_time > 20.0:
+                                        last_alert_time = now
+                                        alert_payload = {
+                                            "camera_id": "CAM_01_BAY_GANTRY",
+                                            "use_case_id": "tt_crew_entering_below_tt",
+                                            "label": label,
+                                            "score": float(conf),
+                                            "boxes": [[float(x1), float(y1), float(x2), float(y2)]]
+                                        }
+                                        try:
+                                            with open("/tmp/video_engine_alert.json", "w") as f_alert:
+                                                json.dump(alert_payload, f_alert)
+                                            print(f"\n[ALERT-TRIGGER] >>> REAL VIOLATION IN ROI: {label} ({conf*100:.0f}%) -> Sent to C++ Engine! <<<")
+                                        except Exception:
+                                            pass
                                 else:
                                     # Normal Detection: Draw clean CYAN box
                                     box_color = (255, 200, 0)
