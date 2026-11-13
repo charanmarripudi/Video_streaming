@@ -1,9 +1,12 @@
 #include "recorder/event_manager.hpp"
+#include "json.hpp"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
+
+using json = nlohmann::json;
 
 namespace engine::recorder {
 
@@ -70,6 +73,7 @@ void EventManager::on_detection(const Detection& d, const buffer::PreEventRing& 
     clip->end_pts_ns = d.pts_ns + post_duration_ns;
     clip->max_allowed_pts_ns = d.pts_ns + max_clip_duration_ns;
     clip->trigger_reasons.push_back(d.use_case_id);
+    clip->primary_detection = d;
     clip->output_fps = cam_config_.get_output_fps(global_fps_);
     clip->width = cam_config_.event_config.output_width;
     clip->height = cam_config_.event_config.output_height;
@@ -122,26 +126,72 @@ void EventManager::finalize_and_persist_clip(ActiveClip clip) {
     size_t total_samples = clip.pre_event_samples.size() + clip.post_event_samples.size();
     double duration_sec = static_cast<double>(total_samples) / static_cast<double>(clip.output_fps);
 
-    // Atomic persistence: write to temp file then rename
+    // 1. Write structured JSON metadata sidecar (_meta.json)
+    std::string meta_path = clip.output_path;
+    size_t ext_pos = meta_path.rfind('.');
+    if (ext_pos != std::string::npos) {
+        meta_path = meta_path.substr(0, ext_pos) + "_meta.json";
+    } else {
+        meta_path += "_meta.json";
+    }
+
+    try {
+        json meta_json;
+        meta_json["camera_id"] = clip.camera_id;
+        meta_json["primary_reason"] = clip.primary_detection.use_case_id;
+        meta_json["score"] = clip.primary_detection.score;
+        meta_json["timestamp_ns"] = clip.primary_detection.pts_ns;
+        meta_json["trigger_reasons"] = clip.trigger_reasons;
+        meta_json["output_fps"] = clip.output_fps;
+        meta_json["resolution"] = { {"width", clip.width}, {"height", clip.height} };
+        meta_json["duration_seconds"] = duration_sec;
+        meta_json["pre_event_samples"] = clip.pre_event_samples.size();
+        meta_json["post_event_samples"] = clip.post_event_samples.size();
+        meta_json["total_samples"] = total_samples;
+        
+        json boxes_arr = json::array();
+        for (const auto& box : clip.primary_detection.boxes) {
+            boxes_arr.push_back({
+                {"label", box.label},
+                {"confidence", box.confidence},
+                {"box", {box.x1, box.y1, box.x2, box.y2}}
+            });
+        }
+        meta_json["bounding_boxes"] = boxes_arr;
+
+        std::ofstream meta_out(meta_path);
+        meta_out << meta_json.dump(2);
+    } catch (...) {}
+
+    // 2. Atomic persistence of media payload: write to temp file then rename
     std::string temp_path = clip.output_path + ".tmp";
     {
         std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
-        out << "STREAM_COPY_MP4_CONTAINER_V2\n"
-            << "CameraID: " << clip.camera_id << "\n"
-            << "TriggerReasons: ";
-        for (const auto& r : clip.trigger_reasons) out << r << ", ";
-        out << "\nEffectiveFPS: " << clip.output_fps << "\n"
-            << "TotalSamples: " << total_samples << " (Pre: " << clip.pre_event_samples.size() 
-            << ", Post: " << clip.post_event_samples.size() << ")\n"
-            << "DurationSec: " << duration_sec << "s (Exact 1.0x Real-Life Speed)\n";
+        
+        // Write standard Annex-B H.264 binary stream with NAL delimiters
+        for (const auto& s : clip.pre_event_samples) {
+            if (s.payload && !s.payload->empty()) {
+                const uint8_t nal_delim[4] = {0x00, 0x00, 0x00, 0x01};
+                out.write(reinterpret_cast<const char*>(nal_delim), 4);
+                out.write(reinterpret_cast<const char*>(s.payload->data()), s.payload->size());
+            }
+        }
+        for (const auto& s : clip.post_event_samples) {
+            if (s.payload && !s.payload->empty()) {
+                const uint8_t nal_delim[4] = {0x00, 0x00, 0x00, 0x01};
+                out.write(reinterpret_cast<const char*>(nal_delim), 4);
+                out.write(reinterpret_cast<const char*>(s.payload->data()), s.payload->size());
+            }
+        }
         out.flush();
     }
 
     std::filesystem::rename(temp_path, clip.output_path);
 
-    std::cout << "[EVENT-MANAGER][" << clip.camera_id << "] CLIP SEALED & PERSISTED: " << clip.output_path << "\n"
-              << "  -> Reasons Combined : " << clip.trigger_reasons.size() << " (Zero Duplicates)\n"
-              << "  -> Exact Duration   : " << duration_sec << " seconds @ " << clip.output_fps << " FPS\n" << std::endl;
+    std::cout << "[EVENT-MANAGER][" << clip.camera_id << "] CLIP SEALED & PERSISTED:\n"
+              << "  -> Video Stream : " << clip.output_path << " (" << total_samples << " packets, " 
+              << duration_sec << "s @ " << clip.output_fps << " FPS)\n"
+              << "  -> Event Record : " << meta_path << " (" << clip.trigger_reasons.size() << " merged reasons)\n" << std::endl;
 }
 
 void EventManager::shutdown(std::chrono::milliseconds /*timeout*/) {

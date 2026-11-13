@@ -14,6 +14,7 @@ storage/events/*.mp4
 storage/events/*.tmp
 storage/events/*.jpg
 storage/events/*.png
+storage/events/*_meta.json
 !storage/events/.gitkeep
 
 # Logs and temporary files

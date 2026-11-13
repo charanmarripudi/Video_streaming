@@ -108,8 +108,9 @@ void StreamCapture::capture_loop(std::stop_token st) {
 
         latest_slot_->publish(frame);
 
-        // Periodic log
+        // Periodic log & watchdog health check
         if (f_idx % (effective_fps_ * 5) == 0) {
+            supervisor_->check_watchdog();
             std::cout << "[CAPTURE][" << config_.id << "] Processed frame #" << f_idx 
                       << " (Ring Bytes: " << (pre_event_ring_->current_bytes() / 1024) 
                       << " KB, State: " << stream_state_to_string(supervisor_->current_state()) << ")" << std::endl;

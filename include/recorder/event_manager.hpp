@@ -18,6 +18,7 @@ struct ActiveClip {
     int64_t end_pts_ns{0};
     int64_t max_allowed_pts_ns{0};
     std::vector<std::string> trigger_reasons;
+    Detection primary_detection;
     std::vector<EncodedSample> pre_event_samples;
     std::vector<EncodedSample> post_event_samples;
     int output_fps{15};
