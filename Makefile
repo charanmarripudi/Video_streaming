@@ -38,4 +38,7 @@ run: $(TARGET)
 clean:
 	rm -rf bin $(OBJS) storage/events/*.mp4 storage/events/*.tmp
 
-.PHONY: all run clean
+feeder:
+	/Users/charanmarripudi/Documents/rtsp_rpi/hpcl_env/bin/python scripts/webcam_feeder.py --width 640 --height 480 --fps 20
+
+.PHONY: all run clean feeder

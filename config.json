@@ -12,16 +12,16 @@
   "cameras": [
     {
       "camera_id": "CAM_01_BAY_GANTRY",
-      "name": "Tanker Bay 1 (Reliance / HPCL)",
+      "name": "Laptop Webcam (Live Test Feed)",
       "enabled": true,
-      "stream_url": "rtsp://admin:pass@192.168.1.101:554/stream1",
-      "credentials_ref": "vault_bay1_creds",
+      "stream_url": "webcam:0",
+      "credentials_ref": "local",
       "decode_mode": "software",
       "stall_timeout_s": 5,
       "fps": 20,
       "capture_resolution": {
-        "width": 1280,
-        "height": 720
+        "width": 640,
+        "height": 480
       },
       "event_config": {
         "pre_event_s": 15,
@@ -32,8 +32,8 @@
         "output_fps": 20
       },
       "output_video": {
-        "width": 1280,
-        "height": 720,
+        "width": 640,
+        "height": 480,
         "bitrate_kbps": 900
       },
       "assigned_use_cases": [

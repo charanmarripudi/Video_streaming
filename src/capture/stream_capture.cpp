@@ -2,6 +2,9 @@
 #include "capture/hardware_factory.hpp"
 #include "recorder/event_manager.hpp"
 #include <iostream>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
 
 namespace engine::capture {
 
@@ -61,6 +64,15 @@ void StreamCapture::capture_loop(std::stop_token st) {
     int64_t current_pts_ns = 0;
     const size_t frame_bytes = static_cast<size_t>(config_.capture_width * config_.capture_height * 3);
 
+    // Support live webcam / external pipe ingestion
+    int pipe_fd = -1;
+    bool is_webcam_mode = (config_.stream_url.rfind("webcam", 0) == 0 || 
+                           config_.stream_url.find(".pipe") != std::string::npos);
+    std::string pipe_path = "/tmp/video_engine_webcam.pipe";
+    if (config_.stream_url.find(".pipe") != std::string::npos) {
+        pipe_path = config_.stream_url;
+    }
+
     while (!st.stop_requested()) {
         auto host_now = std::chrono::steady_clock::now();
         int64_t host_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(host_now.time_since_epoch()).count();
@@ -77,7 +89,7 @@ void StreamCapture::capture_loop(std::stop_token st) {
         sample.pts_ns = current_pts_ns;
         sample.dts_ns = current_pts_ns;
         sample.is_keyframe = is_key;
-        // Lightweight simulated compressed NAL unit (approx 15-40 KB per frame vs 3MB uncompressed!)
+        // Lightweight compressed NAL unit (approx 15-40 KB per frame vs 3MB uncompressed!)
         size_t compressed_bytes = is_key ? 45000 : 8000;
         sample.payload = std::make_shared<const std::vector<uint8_t>>(compressed_bytes, 0xAA);
 
@@ -99,24 +111,66 @@ void StreamCapture::capture_loop(std::stop_token st) {
         frame->height = config_.capture_height;
         frame->channels = 3;
 
-        // Shared immutable buffer
         auto buffer_data = std::make_shared<std::vector<uint8_t>>(frame_bytes);
-        (*buffer_data)[0] = static_cast<uint8_t>((f_idx * 5) % 255);
-        (*buffer_data)[1] = 175;
-        (*buffer_data)[2] = 210;
-        frame->data = buffer_data;
+        bool read_from_pipe = false;
 
+        if (is_webcam_mode) {
+            if (pipe_fd < 0) {
+                pipe_fd = open(pipe_path.c_str(), O_RDONLY | O_NONBLOCK);
+                if (pipe_fd >= 0) {
+                    std::cout << "[CAPTURE][" << config_.id << "] Connected to live webcam pipe: " << pipe_path << std::endl;
+                }
+            }
+            if (pipe_fd >= 0) {
+                size_t total_read = 0;
+                while (total_read < frame_bytes && !st.stop_requested()) {
+                    ssize_t n = read(pipe_fd, buffer_data->data() + total_read, frame_bytes - total_read);
+                    if (n > 0) {
+                        total_read += n;
+                    } else if (n == 0) {
+                        close(pipe_fd);
+                        pipe_fd = -1;
+                        break;
+                    } else {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            if (total_read > 0) {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                }
+                if (total_read == frame_bytes) {
+                    read_from_pipe = true;
+                }
+            }
+        }
+
+        if (!read_from_pipe) {
+            // Simulated BGR frame pattern (fallback)
+            (*buffer_data)[0] = static_cast<uint8_t>((f_idx * 5) % 255);
+            (*buffer_data)[1] = 175;
+            (*buffer_data)[2] = 210;
+        }
+
+        frame->data = buffer_data;
         latest_slot_->publish(frame);
 
         // Periodic log & watchdog health check
         if (f_idx % (effective_fps_ * 5) == 0) {
             supervisor_->check_watchdog();
-            std::cout << "[CAPTURE][" << config_.id << "] Processed frame #" << f_idx 
+            std::cout << "[CAPTURE][" << config_.id << "] Ingested frame #" << f_idx 
+                      << " [" << (read_from_pipe ? "LIVE WEBCAM" : "TEST PATTERN") << "]"
                       << " (Ring Bytes: " << (pre_event_ring_->current_bytes() / 1024) 
                       << " KB, State: " << stream_state_to_string(supervisor_->current_state()) << ")" << std::endl;
         }
 
         std::this_thread::sleep_for(std::chrono::nanoseconds(frame_interval_ns));
+    }
+
+    if (pipe_fd >= 0) {
+        close(pipe_fd);
     }
 }
 
