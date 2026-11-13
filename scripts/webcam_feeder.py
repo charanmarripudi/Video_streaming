@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Webcam Feeder & Live ROI Preview Monitor
+Webcam Feeder, Live ONNX Object Detector & ROI Monitor
 Industrial C++ Video Analytics Engine
 
-Features:
-1. Live Camera Window: Displays live webcam feed with FPS overlay.
-2. Interactive ROI Drawing: Click points with the mouse to define your Region of Interest (ROI).
-3. Auto-Save: Press 's' to save the ROI polygon directly into config.json!
-4. Real-time C++ Streaming: Feeds live frames to the C++ engine via FIFO pipe.
+Upgrades:
+1. PLAIN CAMERA VIEW: Removed green translucent tint completely for clean natural video.
+2. LIVE ONNX DETECTION: Runs YOLOv8n ONNX model in real-time (person, truck, vehicle, etc.).
+3. ROI VIOLATION CHECK: Flags RED bounding box when detected objects enter the ROI zone!
+4. INTERACTIVE ROI: Click to draw ROI points, press 's' to save directly to config.json.
+5. C++ PIPE STREAMING: Feeds frames to C++ engine for pre/post-event recording.
 """
 
 import os
@@ -56,15 +57,15 @@ def save_roi_to_config(config_path, polygon, camera_id="CAM_01_BAY_GANTRY"):
     return False
 
 def main():
-    parser = argparse.ArgumentParser(description="Webcam Feeder & Live ROI Monitor")
+    parser = argparse.ArgumentParser(description="Webcam Feeder, Live AI Detector & ROI Monitor")
     parser.add_argument("--device", type=int, default=0, help="Webcam device index (default: 0)")
     parser.add_argument("--width", type=int, default=640, help="Capture width (default: 640)")
     parser.add_argument("--height", type=int, default=480, help="Capture height (default: 480)")
     parser.add_argument("--fps", type=int, default=20, help="Target FPS (default: 20)")
     parser.add_argument("--pipe", type=str, default="/tmp/video_engine_webcam.pipe", help="FIFO pipe path")
     parser.add_argument("--config", type=str, default="config.json", help="Path to config.json")
+    parser.add_argument("--model", type=str, default="models/yolov8n.onnx", help="Path to ONNX model")
     parser.add_argument("--preview", action="store_true", default=True, help="Show live OpenCV preview window")
-    parser.add_argument("--no-preview", dest="preview", action="store_false", help="Disable preview window (headless)")
     args = parser.parse_args()
 
     try:
@@ -73,7 +74,20 @@ def main():
         print("[ERROR] OpenCV (cv2) is not installed. Please activate hpcl_env.", file=sys.stderr)
         sys.exit(1)
 
-    # 1. Initialize FIFO Pipe
+    # 1. Load Live ONNX Object Detection Model
+    detector = None
+    if os.path.exists(args.model):
+        try:
+            from ultralytics import YOLO
+            print(f"[AI-DETECTOR] Loading ONNX model for live detection: {args.model}...")
+            detector = YOLO(args.model, task="detect")
+            print("[AI-DETECTOR] ONNX Detection Model loaded successfully!")
+        except Exception as e:
+            print(f"[WARNING] Could not load Ultralytics ONNX detector: {e}")
+    else:
+        print(f"[WARNING] Model file {args.model} not found. Running preview without AI overlay.")
+
+    # 2. Initialize FIFO Pipe
     if os.path.exists(args.pipe):
         try:
             os.remove(args.pipe)
@@ -87,7 +101,7 @@ def main():
         print(f"[ERROR] Failed to create FIFO pipe {args.pipe}: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # 2. Open Laptop Webcam
+    # 3. Open Laptop Webcam
     cap = cv2.VideoCapture(args.device)
     if not cap.isOpened():
         print(f"[ERROR] Cannot open webcam device {args.device}!", file=sys.stderr)
@@ -105,10 +119,10 @@ def main():
     print(f"[WEBCAM-FEEDER] Frame size: {frame_bytes} bytes (BGR24)")
     print("[WEBCAM-FEEDER] Waiting for C++ Video Engine to connect to pipe...")
 
-    # Load existing ROI from config if available
+    # Load existing ROI from config
     roi_points = load_roi_from_config(args.config)
     if not roi_points:
-        # Default gantry ROI box (central 70% zone)
+        # Default central monitoring zone
         x_pad = int(actual_w * 0.15)
         y_pad = int(actual_h * 0.20)
         roi_points = [
@@ -118,9 +132,9 @@ def main():
             (x_pad, actual_h - y_pad)
         ]
 
-    # Mouse Callback for interactive ROI drawing
-    window_name = "Industrial C++ Engine - Live Camera & ROI Preview"
+    window_name = "Industrial C++ Engine - Live Camera & AI Detection"
     drawing_points = list(roi_points)
+    show_roi = True
 
     def on_mouse(event, x, y, flags, param):
         nonlocal drawing_points
@@ -136,14 +150,17 @@ def main():
         try:
             cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
             cv2.setMouseCallback(window_name, on_mouse)
-            print("[PREVIEW] Interactive ROI Window Active:")
-            print("  -> Left Click  : Add polygon point")
+            print("[PREVIEW] Interactive Live AI Window Active:")
+            print("  -> Video View  : PLAIN natural video (no green tint)")
+            print("  -> Live AI     : Detecting person, truck, car, etc.")
+            print("  -> Left Click  : Add ROI polygon point")
             print("  -> Right Click : Undo last point")
             print("  -> Press 's'   : Save current ROI polygon to config.json")
             print("  -> Press 'r'   : Reset ROI points")
+            print("  -> Press 'h'   : Toggle ROI boundary visibility on/off")
             print("  -> Press 'q'   : Quit")
         except Exception as e:
-            print(f"[PREVIEW] GUI window unavailable, falling back to headless: {e}")
+            print(f"[PREVIEW] GUI window unavailable: {e}")
             args.preview = False
 
     pipe_fd = None
@@ -158,7 +175,6 @@ def main():
     signal.signal(signal.SIGTERM, sig_handler)
 
     try:
-        # Open FIFO for writing
         pipe_fd = os.open(args.pipe, os.O_WRONLY)
         print("[WEBCAM-FEEDER] C++ Video Engine connected! Streaming live webcam frames...")
 
@@ -177,7 +193,7 @@ def main():
             if frame.shape[1] != actual_w or frame.shape[0] != actual_h:
                 frame = cv2.resize(frame, (actual_w, actual_h))
 
-            # 1. Stream raw frame to C++ Engine via pipe
+            # 1. Stream raw uncompressed frame to C++ Engine via pipe
             raw_data = frame.tobytes()
             try:
                 os.write(pipe_fd, raw_data)
@@ -186,34 +202,81 @@ def main():
                 print("[WEBCAM-FEEDER] C++ engine disconnected from pipe. Exiting.")
                 break
 
-            # 2. Render Live Preview Window with ROI
+            # 2. Render Live Preview Window with AI Detection (PLAIN view, NO green tint)
             if args.preview:
                 display = frame.copy()
+                roi_poly_np = np.array(drawing_points, np.int32).reshape((-1, 1, 2)) if len(drawing_points) >= 3 else None
 
-                # Draw ROI Polygon with semi-transparent overlay
-                if len(drawing_points) >= 3:
-                    pts = np.array(drawing_points, np.int32).reshape((-1, 1, 2))
-                    overlay = display.copy()
-                    cv2.fillPoly(overlay, [pts], (0, 255, 128)) # Light green translucent fill
-                    cv2.addWeighted(overlay, 0.25, display, 0.75, 0, display)
-                    cv2.polylines(display, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+                # Live AI Detection using ONNX model
+                alert_in_roi = False
+                detected_count = 0
 
-                    # Label ROI centroid
-                    cx = int(np.mean([p[0] for p in drawing_points]))
-                    cy = int(np.mean([p[1] for p in drawing_points]))
-                    cv2.putText(display, "ROI ZONE [MONITORED]", (max(10, cx - 80), max(25, cy)), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                elif len(drawing_points) > 0:
+                if detector is not None and frame_count % 2 == 0: # Run inference every 2 frames for smooth 25+ FPS
+                    try:
+                        results = detector(frame, verbose=False, conf=0.35)
+                        if len(results) > 0 and results[0].boxes is not None:
+                            boxes = results[0].boxes
+                            detected_count = len(boxes)
+
+                            for b in boxes:
+                                xyxy = b.xyxy[0].cpu().numpy().astype(int)
+                                x1, y1, x2, y2 = xyxy
+                                conf = float(b.conf[0].cpu().numpy())
+                                cls_id = int(b.cls[0].cpu().numpy())
+                                label = detector.names.get(cls_id, f"obj_{cls_id}")
+
+                                # Check if detection centroid is inside ROI polygon
+                                cx = int((x1 + x2) / 2)
+                                cy = int(y2) # Foot/ground contact point
+                                in_roi = False
+                                if roi_poly_np is not None:
+                                    dist = cv2.pointPolygonTest(roi_poly_np, (float(cx), float(cy)), False)
+                                    in_roi = (dist >= 0)
+
+                                if in_roi:
+                                    alert_in_roi = True
+                                    # VIOLATION: Draw bold RED box
+                                    box_color = (0, 0, 255)
+                                    tag = f"ALERT: {label} {conf*100:.0f}% [IN ROI]"
+                                else:
+                                    # Normal Detection: Draw clean CYAN box
+                                    box_color = (255, 200, 0)
+                                    tag = f"{label} {conf*100:.0f}%"
+
+                                cv2.rectangle(display, (x1, y1), (x2, y2), box_color, 2)
+                                # Tag label banner
+                                (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                                cv2.rectangle(display, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), box_color, -1)
+                                cv2.putText(display, tag, (x1 + 3, max(12, y1 - 4)), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0) if not in_roi else (255, 255, 255), 1)
+                    except Exception as e:
+                        pass
+
+                # Draw Plain ROI boundary (Thin 1px line, NO green translucent fill!)
+                if show_roi and roi_poly_np is not None:
+                    # Clean, thin yellow/cyan boundary line
+                    line_color = (0, 0, 255) if alert_in_roi else (0, 255, 255)
+                    cv2.polylines(display, [roi_poly_np], isClosed=True, color=line_color, thickness=2)
+                    
+                    # Corner anchor dots
                     for pt in drawing_points:
-                        cv2.circle(display, pt, 5, (0, 255, 255), -1)
+                        cv2.circle(display, pt, 4, line_color, -1)
 
-                # Draw Heads-Up Information Banner
-                cv2.rectangle(display, (0, 0), (actual_w, 32), (30, 30, 30), -1)
-                cv2.putText(display, f"LIVE WEBCAM @ {fps_display:.1f} FPS | Frame #{frame_count} | ROI Points: {len(drawing_points)}", 
-                            (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+                    # Subtle text tag on top corner
+                    cv2.putText(display, "MONITORED ROI ZONE", (drawing_points[0][0] + 5, drawing_points[0][1] + 18), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, line_color, 1)
 
-                cv2.putText(display, "[Click: Draw ROI | 's': Save | 'r': Reset | 'q': Quit]", 
-                            (10, actual_h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1)
+                # Draw Modern HUD Banner
+                banner_color = (0, 0, 160) if alert_in_roi else (25, 25, 25)
+                cv2.rectangle(display, (0, 0), (actual_w, 28), banner_color, -1)
+                hud_text = f"LIVE WEBCAM @ {fps_display:.1f} FPS | Detections: {detected_count}"
+                if alert_in_roi:
+                    hud_text += " | *** VIOLATION TRIGGERED IN ROI! ***"
+                cv2.putText(display, hud_text, (10, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+                # Bottom control guide
+                cv2.putText(display, "[Click: Draw ROI | 's': Save | 'r': Reset | 'h': Toggle ROI | 'q': Quit]", 
+                            (10, actual_h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 220, 255), 1)
 
                 cv2.imshow(window_name, display)
                 key = cv2.waitKey(1) & 0xFF
@@ -224,10 +287,13 @@ def main():
                     if len(drawing_points) >= 3:
                         save_roi_to_config(args.config, drawing_points)
                     else:
-                        print("[WARNING] Please click at least 3 points to form a valid ROI polygon before saving.")
+                        print("[WARNING] Click at least 3 points to form an ROI polygon.")
                 elif key == ord('r'):
                     drawing_points.clear()
-                    print("[ROI-DRAW] Cleared all ROI points. Click on window to draw new polygon.")
+                    print("[ROI-DRAW] Cleared all ROI points.")
+                elif key == ord('h'):
+                    show_roi = not show_roi
+                    print(f"[PREVIEW] ROI boundary visibility: {'ON' if show_roi else 'OFF'}")
 
             # Rate limiter
             elapsed = time.time() - t_start
@@ -237,7 +303,7 @@ def main():
 
             if frame_count % (args.fps * 5) == 0:
                 fps_display = frame_count / (time.time() - t0)
-                print(f"[WEBCAM-FEEDER] Live Stream: {frame_count} frames ({fps_display:.1f} FPS)")
+                print(f"[WEBCAM-FEEDER] Streaming @ {fps_display:.1f} FPS (Detections: {detected_count}, Alert: {alert_in_roi})")
 
     finally:
         if pipe_fd is not None:

@@ -50,22 +50,28 @@
             "truck"
           ],
           "roi_polygon": [
+            [
+              100,
+              150
+            ],
+            [
+              540,
+              150
+            ],
+            [
+              540,
+              420
+            ],
+            [
+              100,
+              420
+            ]
+          ],
+          "roi_polygon": [
             [100, 150],
             [540, 150],
             [540, 420],
             [100, 420]
-          ]
-        },
-        {
-          "use_case_id": "fuel_spillage_detection",
-          "enabled": true,
-          "model_ref": "models/spillage.onnx",
-          "threshold": 0.5,
-          "priority": 2,
-          "analysis_fps": 5,
-          "model_input_size": 320,
-          "enabled_classes": [
-            "spillage"
           ]
         }
       ]

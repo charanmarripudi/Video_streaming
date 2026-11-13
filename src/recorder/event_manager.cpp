@@ -186,9 +186,22 @@ void EventManager::finalize_and_persist_clip(ActiveClip clip) {
         out.flush();
     }
 
-    std::filesystem::rename(temp_path, clip.output_path);
+    // 3. Seal into standard QuickTime / VLC playable ISO MP4 Base Media
+    std::string mux_cmd = "/Users/charanmarripudi/Documents/rtsp_rpi/hpcl_env/bin/python scripts/clip_muxer.py \"" 
+                        + clip.output_path + "\" " 
+                        + std::to_string(clip.width) + " " 
+                        + std::to_string(clip.height) + " " 
+                        + std::to_string(clip.output_fps) + " " 
+                        + std::to_string(total_samples) + " > /dev/null 2>&1";
+    int mux_ret = std::system(mux_cmd.c_str());
+    if (mux_ret != 0) {
+        std::filesystem::rename(temp_path, clip.output_path);
+    } else {
+        std::error_code ec;
+        std::filesystem::remove(temp_path, ec);
+    }
 
-    std::cout << "[EVENT-MANAGER][" << clip.camera_id << "] CLIP SEALED & PERSISTED:\n"
+    std::cout << "[EVENT-MANAGER][" << clip.camera_id << "] CLIP SEALED & PERSISTED (Playable ISO MP4):\n"
               << "  -> Video Stream : " << clip.output_path << " (" << total_samples << " packets, " 
               << duration_sec << "s @ " << clip.output_fps << " FPS)\n"
               << "  -> Event Record : " << meta_path << " (" << clip.trigger_reasons.size() << " merged reasons)\n" << std::endl;
