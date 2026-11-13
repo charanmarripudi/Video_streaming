@@ -92,6 +92,7 @@ struct BoundingBox {
     float y2{0.0f};
     std::string label;
     float confidence{0.0f};
+    bool in_roi{true};
 };
 
 struct Detection {
@@ -116,6 +117,7 @@ struct UseCaseConfig {
     std::optional<int> analysis_fps;   // Decoupled inference rate
     std::optional<int> model_input_size;
     std::vector<std::string> enabled_classes;
+    std::vector<std::pair<float, float>> roi_polygon;
 
     // Component Fingerprint: changing a model only restarts this use-case!
     std::string compute_fingerprint() const {
@@ -123,6 +125,7 @@ struct UseCaseConfig {
         ss << use_case_id << "|" << enabled << "|" << model_ref << "|" 
            << threshold << "|" << priority << "|" << analysis_fps.value_or(0);
         for (const auto& c : enabled_classes) ss << ":" << c;
+        for (const auto& pt : roi_polygon) ss << ":" << pt.first << "," << pt.second;
         return crypto::SHA256::hash(ss.str());
     }
 };

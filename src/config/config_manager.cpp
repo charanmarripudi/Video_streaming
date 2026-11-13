@@ -93,6 +93,13 @@ bool ConfigManager::load(const std::string& config_path) {
                                 uc.enabled_classes.push_back(cls.get<std::string>());
                             }
                         }
+                        if (uc_json.contains("roi_polygon") && uc_json["roi_polygon"].is_array()) {
+                            for (const auto& pt : uc_json["roi_polygon"]) {
+                                if (pt.is_array() && pt.size() >= 2) {
+                                    uc.roi_polygon.push_back({pt[0].get<float>(), pt[1].get<float>()});
+                                }
+                            }
+                        }
                         cam.assigned_use_cases.push_back(uc);
                     }
                 }

@@ -68,14 +68,37 @@ public:
     const UseCaseConfig& config() const { return config_; }
 
 private:
+    bool is_point_in_polygon(float px, float py, const std::vector<std::pair<float, float>>& poly) const {
+        if (poly.size() < 3) return true; // Whole frame active if no polygon
+        bool inside = false;
+        size_t n = poly.size();
+        for (size_t i = 0, j = n - 1; i < n; j = i++) {
+            float xi = poly[i].first, yi = poly[i].second;
+            float xj = poly[j].first, yj = poly[j].second;
+            if (((yi > py) != (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) {
+                inside = !inside;
+            }
+        }
+        return inside;
+    }
+
     void maybe_add_box(std::vector<BoundingBox>& list, BoundingBox box) {
-        // Enforce configured threshold
+        // 1. Enforce configured threshold
         if (box.confidence < config_.threshold) return;
 
-        // Enforce configured class filtering
+        // 2. Enforce configured class filtering
         if (!config_.enabled_classes.empty()) {
             auto it = std::find(config_.enabled_classes.begin(), config_.enabled_classes.end(), box.label);
             if (it == config_.enabled_classes.end()) return;
+        }
+
+        // 3. Enforce Region of Interest (ROI) Polygon Check
+        float cx = (box.x1 + box.x2) / 2.0f;
+        float cy = (box.y1 + box.y2) / 2.0f;
+        box.in_roi = is_point_in_polygon(cx, cy, config_.roi_polygon);
+        if (!config_.roi_polygon.empty() && !box.in_roi) {
+            // Object detected outside ROI boundary: ignore
+            return;
         }
 
         list.push_back(std::move(box));

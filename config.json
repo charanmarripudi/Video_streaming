@@ -48,6 +48,12 @@
           "enabled_classes": [
             "person",
             "truck"
+          ],
+          "roi_polygon": [
+            [100, 150],
+            [540, 150],
+            [540, 420],
+            [100, 420]
           ]
         },
         {
@@ -60,48 +66,6 @@
           "model_input_size": 320,
           "enabled_classes": [
             "spillage"
-          ]
-        }
-      ]
-    },
-    {
-      "camera_id": "CAM_02_ENTRY_GATE",
-      "name": "Entry Gantry & TT Availability",
-      "enabled": true,
-      "stream_url": "rtsp://admin:pass@192.168.1.102:554/stream1",
-      "credentials_ref": "vault_gate_creds",
-      "decode_mode": "software",
-      "stall_timeout_s": 5,
-      "fps": 15,
-      "capture_resolution": {
-        "width": 1280,
-        "height": 720
-      },
-      "event_config": {
-        "pre_event_s": 10,
-        "post_event_s": 10,
-        "cooldown_s": 20,
-        "max_clip_s": 90,
-        "output_format": "mp4",
-        "output_fps": 15
-      },
-      "output_video": {
-        "width": 1280,
-        "height": 720,
-        "bitrate_kbps": 800
-      },
-      "assigned_use_cases": [
-        {
-          "use_case_id": "tt_crew_non_availability",
-          "enabled": true,
-          "model_ref": "models/tt_crew_non_availability.onnx",
-          "threshold": 0.4,
-          "priority": 1,
-          "analysis_fps": 10,
-          "model_input_size": 640,
-          "enabled_classes": [
-            "no-TT_Crew_Availability",
-            "tt_crew_available"
           ]
         }
       ]
