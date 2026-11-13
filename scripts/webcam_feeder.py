@@ -36,7 +36,8 @@ def load_camera_use_case_config(config_path, camera_id="CAM_01_BAY_GANTRY"):
         "use_case_id": "intrusion",
         "fps": 20,
         "width": 640,
-        "height": 480
+        "height": 480,
+        "pre_event_s": 15
     }
     try:
         if os.path.exists(config_path):
@@ -45,6 +46,7 @@ def load_camera_use_case_config(config_path, camera_id="CAM_01_BAY_GANTRY"):
             for cam in cfg.get("cameras", []):
                 if cam.get("camera_id") == camera_id:
                     cfg_data["fps"] = cam.get("fps", 20)
+                    cfg_data["pre_event_s"] = cam.get("event_config", {}).get("pre_event_s", 15)
                     res = cam.get("capture_resolution", {})
                     cfg_data["width"] = res.get("width", 640)
                     cfg_data["height"] = res.get("height", 480)
@@ -95,6 +97,7 @@ def main():
     parser.add_argument("--config", type=str, default="config.json", help="Path to config.json")
     parser.add_argument("--model", type=str, default="models/intrusion.onnx", help="Path to ONNX model (default: models/intrusion.onnx)")
     parser.add_argument("--threshold", type=float, default=None, help="Confidence threshold (e.g. 0.50)")
+    parser.add_argument("--arming-delay", type=float, default=None, help="Initial arming grace period in seconds to buffer pre-event history (default: pre_event_s from config)")
     parser.add_argument("--preview", action="store_true", default=True, help="Show live OpenCV preview window")
     parser.add_argument("--no-preview", dest="preview", action="store_false", help="Disable live preview window")
     args = parser.parse_args()
@@ -112,6 +115,7 @@ def main():
     enabled_classes = cfg_data.get("enabled_classes", ["person"])
     use_case_id = cfg_data.get("use_case_id", "intrusion")
     camera_id = "CAM_01_BAY_GANTRY"
+    arming_delay = args.arming_delay if args.arming_delay is not None else float(cfg_data.get("pre_event_s", 15.0))
 
     print("=======================================================")
     print("      INDUSTRIAL C++ VIDEO ENGINE - WEBCAM FEEDER      ")
@@ -120,6 +124,7 @@ def main():
     print(f"  -> Use Case ID      : {use_case_id}")
     print(f"  -> Enabled Classes  : {enabled_classes} (All other objects ignored)")
     print(f"  -> Min Confidence   : {conf_threshold:.2f}")
+    print(f"  -> Arming Delay     : {arming_delay:.1f}s (Pre-event buffer accumulation)")
     print(f"  -> Resolution       : {args.width}x{args.height} @ {args.fps} FPS")
     print(f"  -> Video Stream Sink: tcp://127.0.0.1:{args.tcp_port}")
     print("=======================================================")
@@ -153,6 +158,12 @@ def main():
 
     print(f"[WEBCAM-FEEDER] Webcam opened: {actual_w}x{actual_h} @ ~{args.fps} FPS")
     print(f"[WEBCAM-FEEDER] Frame size: {frame_bytes} bytes (BGR24)")
+
+    # Warm up camera sensor to calibrate auto-exposure and white balance
+    print("[WEBCAM-FEEDER] Warming up camera sensor (auto-exposure)...")
+    for _ in range(8):
+        cap.read()
+        time.sleep(0.03)
 
     # Load existing ROI points from config
     roi_points = cfg_data.get("roi_polygon", [])
@@ -239,12 +250,17 @@ def main():
         interval = 1.0 / args.fps
         frame_count = 0
         t0 = time.time()
+        feeder_start_time = time.time()
         fps_display = args.fps
         detected_count = 0
         alert_in_roi = False
 
         while running:
             t_start = time.time()
+            now = time.time()
+            elapsed_since_start = now - feeder_start_time
+            is_armed = (elapsed_since_start >= arming_delay)
+            rem_arming_s = max(0, int(arming_delay - elapsed_since_start) + 1)
             ret, frame = cap.read()
             if not ret:
                 time.sleep(0.01)
@@ -305,14 +321,15 @@ def main():
             now = time.time()
             active_detections = [d for d in cached_detections if (now - d.get("updated_at", now)) < 0.6]
 
-            alert_in_roi = False
             # Re-evaluate ROI on cached detections in case drawing points change
+            any_in_roi = False
             for d in active_detections:
                 if roi_poly_np is not None:
                     d["in_roi"] = (cv2.pointPolygonTest(roi_poly_np, (float(d["cx"]), float(d["cy"])), False) >= 0)
                 if d["in_roi"]:
-                    alert_in_roi = True
+                    any_in_roi = True
 
+            alert_in_roi = any_in_roi and is_armed
             detected_count = len(active_detections)
 
             # RENDER SMOOTH BOUNDING BOXES ON EVERY FRAME (NO BLINKING)
@@ -322,9 +339,15 @@ def main():
                 conf = det["conf"]
                 in_roi = det["in_roi"]
 
-                if in_roi:
-                    box_color = (0, 0, 255) # Bright RED for Intrusion
+                if in_roi and not is_armed:
+                    # Grace period: buffering pre-event frames
+                    box_color = (0, 165, 255)  # Amber
+                    tag = f"[ARMING: {rem_arming_s}s] {label} {conf*100:.0f}% IN ROI"
+                    text_color = (255, 255, 255)
+                elif in_roi and is_armed:
+                    box_color = (0, 0, 255)  # Bright RED for Intrusion
                     tag = f"ALERT: {label} {conf*100:.0f}% [INTRUSION IN ROI]"
+                    text_color = (255, 255, 255)
 
                     # Emit real violation trigger to C++ engine (with 20s cooldown)
                     if now - last_alert_time > 20.0:
@@ -346,34 +369,44 @@ def main():
                     # Clean CYAN box for person outside monitored zone
                     box_color = (255, 200, 0)
                     tag = f"{label} {conf*100:.0f}%"
+                    text_color = (0, 0, 0)
 
                 # Draw box and label banner
                 cv2.rectangle(display, (x1, y1), (x2, y2), box_color, 2)
                 (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
                 cv2.rectangle(display, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), box_color, -1)
                 cv2.putText(display, tag, (x1 + 3, max(12, y1 - 4)), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255) if in_roi else (0, 0, 0), 1)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1)
 
             # Draw Plain ROI boundary (Thin 2px line, NO translucent tint!)
             if show_roi and roi_poly_np is not None:
-                line_color = (0, 0, 255) if alert_in_roi else (0, 255, 255)
+                if alert_in_roi:
+                    line_color = (0, 0, 255)
+                    roi_tag = "*** INTRUSION ACTIVE ***"
+                elif any_in_roi and not is_armed:
+                    line_color = (0, 165, 255)
+                    roi_tag = f"ROI ZONE [ARMING: {rem_arming_s}s]"
+                else:
+                    line_color = (0, 255, 255)
+                    roi_tag = "MONITORED ROI ZONE"
+
                 cv2.polylines(display, [roi_poly_np], isClosed=True, color=line_color, thickness=2)
                 
                 # Corner anchor dots
                 for pt in drawing_points:
                     cv2.circle(display, pt, 4, line_color, -1)
 
-                # ROI zone label
-                roi_tag = "MONITORED ROI ZONE" if not alert_in_roi else "*** INTRUSION ACTIVE ***"
                 cv2.putText(display, roi_tag, (drawing_points[0][0] + 5, drawing_points[0][1] + 18), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, line_color, 1)
 
             # Draw Modern HUD Banner
-            banner_color = (0, 0, 160) if alert_in_roi else (25, 25, 25)
+            banner_color = (0, 0, 160) if alert_in_roi else ((30, 70, 120) if not is_armed else (25, 25, 25))
             cv2.rectangle(display, (0, 0), (actual_w, 28), banner_color, -1)
             connected_str = "[STREAMING TO C++ ENGINE]" if stream_sock is not None else "[WAITING FOR C++ ENGINE]"
             if alert_in_roi:
                 hud_text = f"LIVE WEBCAM @ {fps_display:.1f} FPS | {connected_str} | *** INTRUSION IN ROI! ***"
+            elif not is_armed:
+                hud_text = f"LIVE WEBCAM @ {fps_display:.1f} FPS | {connected_str} | [PRE-EVENT BUFFERING: ARMED IN {rem_arming_s}s]"
             else:
                 hud_text = f"LIVE WEBCAM @ {fps_display:.1f} FPS | {connected_str} | Filter: {','.join(enabled_classes)} | Count: {detected_count}"
             cv2.putText(display, hud_text, (10, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
